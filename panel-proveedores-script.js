@@ -32,7 +32,7 @@
       google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn](...args);
     });
     const timeout = new Promise((_, reject)=>{
-      setTimeout(()=>reject(new Error('Se agotó el tiempo de espera (25s) para '+fn+'.')), 25000);
+      setTimeout(()=>reject(new Error('Se agotó el tiempo de espera (90s) para '+fn+'.')), 90000);
     });
     return Promise.race([llamada, timeout]);
   }

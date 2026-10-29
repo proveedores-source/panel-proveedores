@@ -37,7 +37,7 @@
     return Promise.race([llamada, timeout]);
   }
 
-  const CLIENT_VERSION = 'v2026-10-29b-compras-transf'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-10-29d-compras-viejas-transf'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -138,7 +138,7 @@
       const ov = pagadoOverrides[r._key];
       if(ov){
         if(ahora-ov.ts > OVERRIDE_MS || !!r.pagado===ov.pagado) delete pagadoOverrides[r._key];
-        else r.pagado = ov.pagado;
+        else aplicarPagado_(r, ov.pagado);
       }
       // Si la columna "Pagado" está tildada, se considera completado
       // (también para compras/presupuestos, no solo facturas).
@@ -610,9 +610,8 @@
       if(nuevoEstado!=='completado') patch.fechaResuelta = '';
       try{
         const kind = rec.tipo==='factura' ? 'factura' : 'otro';
-        if(!rec._rowNum){ showToast('Es un registro histórico de la hoja vieja "Otros": es de solo lectura.'); return; }
-        const idOrRow = rec._rowNum;
-        await runServer('updateRecordRouter', kind, rec.fundacion||null, idOrRow, patch, `Movió "${rec.proveedor}" de ${ESTADO_LABEL[rec.estado]} a ${ESTADO_LABEL[nuevoEstado]}`);
+        if(!rec._rowNum && kind==='otro') await runServer('updateOtroLegacyRecord', rec.id, patch);
+        else await runServer('updateRecordRouter', kind, rec.fundacion||null, rec._rowNum, patch, `Movió "${rec.proveedor}" de ${ESTADO_LABEL[rec.estado]} a ${ESTADO_LABEL[nuevoEstado]}`);
         showToast('Movido a '+ESTADO_LABEL[nuevoEstado]+'.');
         refreshAll();
       }catch(err){ showToast('No se pudo mover: '+(err.message||'error')); }
@@ -620,13 +619,17 @@
   });
 
   /* ---------------- EDIT MODAL ---------------- */
-  let editingId=null, editingKind='otro', editingFundacion=null;
+  let editingId=null, editingKind='otro', editingFundacion=null, editingLegacy=false;
+  // Sin esto, un campo obligatorio oculto del formulario bloqueaba "Guardar" sin avisar nada.
+  $('#edit-form').setAttribute('novalidate','');
   function openEditModal(key){
     const r = records.find(x=>x._key===key); if(!r) return;
     editingKind = r.tipo==='factura' ? 'factura' : 'otro';
     editingFundacion = r.fundacion || null;
-    editingId = r._rowNum || null; // tanto facturas como Otros MDG/RVP se identifican por fila (antes se mandaba el id y el servidor escribía en otra fila)
-    if(!editingId) showToast('Registro histórico de la hoja vieja "Otros": solo lectura.');
+    // Facturas y Otros MDG/RVP se identifican por fila. Los registros de la
+    // hoja vieja "Otros" no tienen fila propia: se identifican por su id.
+    editingLegacy = !r._rowNum && editingKind==='otro';
+    editingId = r._rowNum || (editingLegacy ? r.id : null);
     $('#e-tipo').value=r.tipo; $('#e-fuente').value=r.fuente||'email'; $('#e-proveedor').value=r.proveedor||'';
     $('#e-cuit').value=formatearCuit_(r.cuit||''); $('#e-importe').value=r.importe||'';
     $('#e-numfactura').value=r.numeroFactura||''; $('#e-cae').value=r.cae||'';
@@ -658,7 +661,7 @@
 
   $('#edit-form').addEventListener('submit', async (e)=>{
     e.preventDefault();
-    if(!editingId) return;
+    if(!editingId){ showToast('No se pudo identificar este registro. Recargá el panel y probá de nuevo.'); return; }
     const tipo = $('#e-tipo').value;
     const proveedorNuevo = $('#e-proveedor').value.trim();
     const patch = editingKind==='factura' ? {
@@ -682,8 +685,11 @@
       prioridad: editSelectedPrio, estado:$('#e-estado').value
     };
     try{
-      await runServer('updateRecordRouter', editingKind, editingFundacion, editingId, patch, `Editó registro de "${proveedorNuevo}"`);
-      showToast('Cambios guardados.'); closeModal(); refreshAll();
+      if(editingLegacy) await runServer('updateOtroLegacyRecord', editingId, patch);
+      else await runServer('updateRecordRouter', editingKind, editingFundacion, editingId, patch, `Editó registro de "${proveedorNuevo}"`);
+      const rLocal = records.find(x=> editingLegacy ? x.id===editingId : (x._rowNum===editingId && x.fundacion===editingFundacion && (x.tipo==='factura')===(editingKind==='factura')));
+      if(rLocal){ rLocal.estado = patch.estado; if(patch.fechaResuelta!==undefined) rLocal.fechaResuelta = patch.fechaResuelta; rLocal.prioridad = patch.prioridad; }
+      showToast('Cambios guardados.'); closeModal(); renderAll(); refreshAll();
     }catch(err){ showToast('No se pudo guardar: '+(err.message||'error')); }
   });
   $('#btn-delete').addEventListener('click', async ()=>{
@@ -692,7 +698,7 @@
       ? '¿Eliminar esta factura del panel? No se borra la fila de la planilla real (se mantiene para el registro contable de Mariana), pero deja de mostrarse en Tablero, Listado y Dashboard.'
       : '¿Eliminar este registro? No se puede deshacer.';
     if(confirm(msg)){
-      try{ await runServer('deleteRecordRouter', editingKind, editingFundacion, editingId); showToast('Eliminado del panel.'); closeModal(); refreshAll(); }
+      try{ if(editingLegacy) await runServer('deleteOtroLegacyRecord', editingId); else await runServer('deleteRecordRouter', editingKind, editingFundacion, editingId); showToast('Eliminado del panel.'); closeModal(); refreshAll(); }
       catch(err){ showToast('No se pudo completar: '+(err.message||'error')); }
     }
   });
@@ -1661,7 +1667,10 @@
     return sinCeros || last;
   }
   function getFacturasPendientesDePago(){
-    return records.filter(r => (r.tipo==='factura' || r.tipo==='compra') && !r.pagado && r.fundacion && r._rowNum && r.estado!=='eliminado' && r.estado!=='completado');
+    return records.filter(r => !r.pagado && r.estado!=='eliminado' && r.estado!=='completado' && (
+      (r.tipo==='factura' && r.fundacion && r._rowNum) ||
+      (r.tipo==='compra' && ((r.fundacion && r._rowNum) || (!r._rowNum && r.id)))   // compras nuevas (Otros MDG/RVP) y viejas (hoja "Otros")
+    ));
   }
   function getTransfFiltradas(){
     const fund = $('#transf-filt-fundacion').value;
@@ -1679,7 +1688,7 @@
     const datos = filas.map(r=>{
       const match = findAgendaMatch(r.proveedor, r.cuit);
       return {
-        'Fundación': r.fundacion.toUpperCase(),
+        'Fundación': (r.fundacion||'').toUpperCase(),
         'Proveedor': r.proveedor || '',
         'CUIT': r.cuit || '',
         'N° Factura': numeroDoc_(r),
@@ -1707,7 +1716,7 @@
       const tieneCbu = match && match.cbu;
       return `<tr>
         <td style="text-align:center"><input type="checkbox" class="transf-check" data-transfid="${r._key}" ${tieneCbu?'':'disabled'}></td>
-        <td>${r.fundacion.toUpperCase()}</td><td>${escapeHtml(r.proveedor)}</td><td class="mono">${escapeHtml(r.cuit)}</td>
+        <td>${(r.fundacion||'—').toUpperCase()}</td><td>${escapeHtml(r.proveedor)}</td><td class="mono">${escapeHtml(r.cuit)}</td>
         <td class="mono">${r.tipo==='compra' ? '<span class="ticket-tag">Compra</span> ' : ''}${escapeHtml(numeroDoc_(r))}</td><td class="mono">${fmtMoney(r.importe)}</td>
         <td class="mono">${match? escapeHtml(match.cbu||'—') : '—'}</td>
         <td>${match? escapeHtml(match.email||'—') : '—'}</td>
@@ -1747,7 +1756,7 @@
       <td class="mono">${escapeHtml(numeroDoc_(r))}</td>
       <td class="mono">${fmtMoney(r.importe)}</td>
     </tr>`).join('');
-    $('#confirmar-pagos-overlay').dataset.lista = JSON.stringify(lista.map(r=>({kind:r.tipo==='factura'?'factura':'otro', fundacion:r.fundacion, rowNum:r._rowNum, proveedor:r.proveedor})));
+    $('#confirmar-pagos-overlay').dataset.lista = JSON.stringify(lista.map(r=>({kind:r.tipo==='factura'?'factura':'otro', fundacion:r.fundacion, rowNum:r._rowNum, proveedor:r.proveedor, legacyId: r._rowNum ? '' : (r.id||''), key:r._key})));
     $('#confirmar-pagos-overlay').dataset.banco = banco || '';
     $('#confirmar-pagos-overlay').querySelector('.hint').textContent = banco
       ? `Se tildaron todas por defecto y se van a marcar como pagadas vía "${banco}". Destildá las que no correspondan antes de confirmar.`
@@ -1766,7 +1775,16 @@
     $('#confirmar-pagos-aceptar').disabled = true;
     let ok=0, fallidos=0;
     for(const item of marcar){
-      try{ await runServer('confirmarPagoRouterConBanco', item.kind||'factura', item.fundacion, item.rowNum, banco, item.proveedor||''); ok++; registrarPagadoLocal_(claveRegistro_(item.fundacion, item.kind||'factura', item.rowNum), true); }
+      try{
+        if(item.legacyId){
+          await runServer('updateOtroLegacyRecord', item.legacyId, { estado:'completado', fechaResuelta: todayISO() });
+          const rl = records.find(x=>x.id===item.legacyId && !x._rowNum); if(rl){ rl.estado='completado'; rl.fechaResuelta=todayISO(); }
+        } else {
+          await runServer('confirmarPagoRouterConBanco', item.kind||'factura', item.fundacion, item.rowNum, banco, item.proveedor||'');
+          registrarPagadoLocal_(claveRegistro_(item.fundacion, item.kind||'factura', item.rowNum), true);
+        }
+        ok++;
+      }
       catch(err){ fallidos++; }
     }
     $('#confirmar-pagos-aceptar').disabled = false;
@@ -1964,7 +1982,9 @@
     // Provincia exige UN convenio (una empresa/CUIT) por archivo, así que
     // se separa automáticamente por fundación si hay una mezcla de MDG y RVP.
     const porFundacion = {};
-    sel.forEach(r=>{ (porFundacion[r.fundacion] = porFundacion[r.fundacion]||[]).push(r); });
+    const sinFund = sel.filter(r=>!r.fundacion);
+    if(sinFund.length) showToast('⚠️ '+sinFund.length+' compra(s) vieja(s) sin fundación asignada quedaron afuera del archivo Provincia. Asignales MDG o RVP con Ver / Editar.');
+    sel.filter(r=>r.fundacion).forEach(r=>{ (porFundacion[r.fundacion] = porFundacion[r.fundacion]||[]).push(r); });
 
     let huboExito = false;
     const incluidasTotal = [];

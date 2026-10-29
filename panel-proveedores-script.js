@@ -37,7 +37,7 @@
     return Promise.race([llamada, timeout]);
   }
 
-  const CLIENT_VERSION = 'v2026-09-16-facturas-paginadas'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-10-29b-compras-transf'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -110,7 +110,55 @@
   }
   async function cargarLogSiHaceFalta(){ if(!logCargado) await cargarLog_(); }
 
+  /* ---- Cambios de "Pagado" recién hechos desde el panel ----
+     Se recuerdan unos minutos y se vuelven a aplicar sobre los datos que
+     llegan del servidor, para que una recarga que empezó ANTES de guardar
+     (o una lectura cacheada del servidor) no "destilde" la casilla sola. */
+  // Clave única por registro: incluye si es factura (MDG/RVP) u "otro"
+  // (Otros MDG/RVP), porque la fila 5 de MDG y la fila 5 de Otros MDG
+  // son registros distintos y antes compartían la misma clave.
+  function claveRegistro_(fund, kind, rowNum){ return fund+':'+(kind==='factura'?'f':'o')+':'+rowNum; }
+  function numeroDoc_(r){ return r.tipo==='factura' ? (r.numeroFactura||'') : (r.numeroComprobante||''); }
+  const pagadoOverrides = {}; // key -> { pagado, ts }
+  const OVERRIDE_MS = 6*60*1000;
+  function registrarPagadoLocal_(key, pagado){
+    pagadoOverrides[key] = { pagado: !!pagado, ts: Date.now() };
+    const r = records.find(x=>x._key===key);
+    if(r) aplicarPagado_(r, !!pagado);
+  }
+  function aplicarPagado_(r, pagado){
+    r.pagado = pagado;
+    if(r.estado==='eliminado') return;
+    if(pagado){ r.estado='completado'; if(!r.fechaResuelta) r.fechaResuelta=todayISO(); }
+    else if(r.estado==='completado'){ r.estado='pendiente'; r.fechaResuelta=''; }
+  }
+  function normalizarRecords_(){
+    const ahora = Date.now();
+    records.forEach(r=>{
+      const ov = pagadoOverrides[r._key];
+      if(ov){
+        if(ahora-ov.ts > OVERRIDE_MS || !!r.pagado===ov.pagado) delete pagadoOverrides[r._key];
+        else r.pagado = ov.pagado;
+      }
+      // Si la columna "Pagado" está tildada, se considera completado
+      // (también para compras/presupuestos, no solo facturas).
+      if(r.pagado && r.estado!=='eliminado') r.estado='completado';
+    });
+  }
+
+  /* Evita que dos recargas se pisen: si llega un pedido mientras otra
+     recarga está en curso, se hace UNA recarga más al terminar, y la
+     recarga vieja no pinta datos desactualizados. */
+  let refreshEnCurso = null, refreshPendiente = false;
   async function refreshAll(){
+    if(refreshEnCurso){ refreshPendiente = true; return refreshEnCurso; }
+    refreshEnCurso = (async()=>{
+      do { refreshPendiente = false; await refreshAllInterno_(); } while(refreshPendiente);
+    })();
+    try{ await refreshEnCurso; } finally { refreshEnCurso = null; }
+  }
+
+  async function refreshAllInterno_(){
     cargaInicialCompleta = false;
     const fallidas = [];
     const tiempos = [];
@@ -150,7 +198,8 @@
     // Las "eliminadas" ya no se filtran acá globalmente — cada vista decide
     // si las excluye (Tablero/Dashboard/Transferencias siempre las excluyen)
     // o si las muestra (Listado tiene un selector Activas/Eliminadas/Todas).
-    records.forEach(r=>{ r._key = r.fundacion ? (r.fundacion+':'+r._rowNum) : r.id; });
+    records.forEach(r=>{ r._key = (r.fundacion && r._rowNum) ? claveRegistro_(r.fundacion, r.tipo==='factura'?'factura':'otro', r._rowNum) : r.id; });
+    normalizarRecords_();
     if(!mdgR.ok) fallidas.push('facturas MDG ('+(mdgR.error&&mdgR.error.message||'error')+')');
     if(!rvpR.ok) fallidas.push('facturas RVP ('+(rvpR.error&&rvpR.error.message||'error')+')');
     if(!otrosR.ok) fallidas.push('otros registros ('+(otrosR.error&&otrosR.error.message||'error')+')');
@@ -182,6 +231,7 @@
     $('#diagnostico-carga-texto').textContent = 'Total: '+(totalMs/1000).toFixed(1)+'s\n'+tiempos.join('\n');
     $('#me-chip').textContent += '  ·  cliente: '+CLIENT_VERSION+'  ·  facturas: '+records.length+'  ·  carga: '+(totalMs/1000).toFixed(1)+'s';
 
+    if(refreshPendiente) return; // viene otra recarga más nueva: no pintar datos viejos
     renderAll();
     if(soyAdmin) refreshUsuarios();
     cargaInicialCompleta = true;
@@ -560,7 +610,8 @@
       if(nuevoEstado!=='completado') patch.fechaResuelta = '';
       try{
         const kind = rec.tipo==='factura' ? 'factura' : 'otro';
-        const idOrRow = kind==='factura' ? rec._rowNum : rec.id;
+        if(!rec._rowNum){ showToast('Es un registro histórico de la hoja vieja "Otros": es de solo lectura.'); return; }
+        const idOrRow = rec._rowNum;
         await runServer('updateRecordRouter', kind, rec.fundacion||null, idOrRow, patch, `Movió "${rec.proveedor}" de ${ESTADO_LABEL[rec.estado]} a ${ESTADO_LABEL[nuevoEstado]}`);
         showToast('Movido a '+ESTADO_LABEL[nuevoEstado]+'.');
         refreshAll();
@@ -574,7 +625,8 @@
     const r = records.find(x=>x._key===key); if(!r) return;
     editingKind = r.tipo==='factura' ? 'factura' : 'otro';
     editingFundacion = r.fundacion || null;
-    editingId = editingKind==='factura' ? r._rowNum : r.id;
+    editingId = r._rowNum || null; // tanto facturas como Otros MDG/RVP se identifican por fila (antes se mandaba el id y el servidor escribía en otra fila)
+    if(!editingId) showToast('Registro histórico de la hoja vieja "Otros": solo lectura.');
     $('#e-tipo').value=r.tipo; $('#e-fuente').value=r.fuente||'email'; $('#e-proveedor').value=r.proveedor||'';
     $('#e-cuit').value=formatearCuit_(r.cuit||''); $('#e-importe').value=r.importe||'';
     $('#e-numfactura').value=r.numeroFactura||''; $('#e-cae').value=r.cae||'';
@@ -901,8 +953,23 @@
     }).join('');
     $$('[data-pagado]').forEach(chk=>chk.addEventListener('change', async ()=>{
       const [kind, fund, rowNum] = chk.dataset.pagado.split(':');
-      try{ await runServer('setPagadoRouter', kind, fund, parseInt(rowNum,10), chk.checked); showToast(chk.checked?'Marcado como pagado/completado.':'Desmarcado.'); refreshAll(); }
-      catch(err){ showToast('Error: '+(err.message||'')); chk.checked = !chk.checked; }
+      const key = claveRegistro_(fund, kind, rowNum);
+      const recChk = records.find(x=>x._key===key);
+      const valor = chk.checked;
+      const previo = !valor;
+      chk.disabled = true;
+      registrarPagadoLocal_(key, valor);
+      try{
+        await runServer('setPagadoRouter', kind, fund, parseInt(rowNum,10), valor, recChk?recChk.proveedor:'');
+        showToast(valor?'Marcado como pagado/completado.':'Desmarcado.');
+        renderAll();
+        refreshAll();
+      }catch(err){
+        registrarPagadoLocal_(key, previo);
+        delete pagadoOverrides[key];
+        showToast('Error: '+(err.message||''));
+        renderAll();
+      }
     }));
     $$('[data-edit]').forEach(b=>b.addEventListener('click',()=>openEditModal(b.dataset.edit)));
   }
@@ -1064,9 +1131,10 @@
 
   /* ---------------- COUNTERS ---------------- */
   function renderCounters(){
-    const pendRecs = records.filter(r=>r.estado!=='completado');
-    const facturasPendRecs = records.filter(r=>r.tipo==='factura' && r.estado!=='completado');
-    const overdueRecs = records.filter(r=>r.estado!=='completado' && daysBetween(r.fechaRecibida, todayISO())>7);
+    const activos = records.filter(r=>r.estado!=='eliminado');
+    const pendRecs = activos.filter(r=>r.estado!=='completado');
+    const facturasPendRecs = activos.filter(r=>r.tipo==='factura' && r.estado!=='completado');
+    const overdueRecs = activos.filter(r=>r.estado!=='completado' && daysBetween(r.fechaRecibida, todayISO())>7);
     const importePend = pendRecs.reduce((s,r)=>s+(Number(r.importe)||0),0);
     const chips = [
       {n:pendRecs.length, l:'Pendientes', lista:pendRecs, titulo:'Pendientes'},
@@ -1084,7 +1152,7 @@
   /* ---------------- RESUMEN (manual) ---------------- */
   function buildSummaryHTML(){
     const today = todayISO();
-    const pendientes = records.filter(r=>r.estado!=='completado');
+    const pendientes = records.filter(r=>r.estado!=='completado' && r.estado!=='eliminado');
     const facturasPend = pendientes.filter(r=>r.tipo==='factura');
     const importePend = pendientes.reduce((s,r)=>s+(Number(r.importe)||0),0);
     const masAntiguos = [...pendientes].sort((a,b)=>daysBetween(b.fechaRecibida,today)-daysBetween(a.fechaRecibida,today)).slice(0,5);
@@ -1593,7 +1661,7 @@
     return sinCeros || last;
   }
   function getFacturasPendientesDePago(){
-    return records.filter(r => r.tipo==='factura' && !r.pagado && r.fundacion && r.estado!=='eliminado');
+    return records.filter(r => (r.tipo==='factura' || r.tipo==='compra') && !r.pagado && r.fundacion && r._rowNum && r.estado!=='eliminado' && r.estado!=='completado');
   }
   function getTransfFiltradas(){
     const fund = $('#transf-filt-fundacion').value;
@@ -1614,7 +1682,7 @@
         'Fundación': r.fundacion.toUpperCase(),
         'Proveedor': r.proveedor || '',
         'CUIT': r.cuit || '',
-        'N° Factura': r.numeroFactura || '',
+        'N° Factura': numeroDoc_(r),
         'Importe': Number(r.importe)||0,
         'Fecha Recibida': r.fechaRecibida || '',
         'CBU/CVU/Alias': match ? (match.cbu||'') : '',
@@ -1638,9 +1706,9 @@
       const match = findAgendaMatch(r.proveedor, r.cuit);
       const tieneCbu = match && match.cbu;
       return `<tr>
-        <td style="text-align:center"><input type="checkbox" class="transf-check" data-transfid="${r.fundacion}:${r._rowNum}" ${tieneCbu?'':'disabled'}></td>
+        <td style="text-align:center"><input type="checkbox" class="transf-check" data-transfid="${r._key}" ${tieneCbu?'':'disabled'}></td>
         <td>${r.fundacion.toUpperCase()}</td><td>${escapeHtml(r.proveedor)}</td><td class="mono">${escapeHtml(r.cuit)}</td>
-        <td class="mono">${escapeHtml(r.numeroFactura)}</td><td class="mono">${fmtMoney(r.importe)}</td>
+        <td class="mono">${r.tipo==='compra' ? '<span class="ticket-tag">Compra</span> ' : ''}${escapeHtml(numeroDoc_(r))}</td><td class="mono">${fmtMoney(r.importe)}</td>
         <td class="mono">${match? escapeHtml(match.cbu||'—') : '—'}</td>
         <td>${match? escapeHtml(match.email||'—') : '—'}</td>
         <td>${tieneCbu? '<span style="color:var(--baja)">✓ OK</span>' : '<span style="color:var(--alta)">⚠ falta en Agenda</span>'}</td>
@@ -1658,8 +1726,7 @@
     const pendientes = getFacturasPendientesDePago();
     const seleccionadas = [];
     $$('.transf-check:checked').forEach(chk=>{
-      const [fund, rowNum] = chk.dataset.transfid.split(':');
-      const rec = pendientes.find(r=>r.fundacion===fund && String(r._rowNum)===rowNum);
+      const rec = pendientes.find(r=>r._key===chk.dataset.transfid);
       if(rec) seleccionadas.push(rec);
     });
     return seleccionadas;
@@ -1677,10 +1744,10 @@
     $('#confirmar-pagos-body').innerHTML = lista.map((r,i)=>`<tr>
       <td style="text-align:center"><input type="checkbox" class="confirmar-pago-check" data-idx="${i}" checked></td>
       <td>${escapeHtml(r.proveedor||'—')}</td>
-      <td class="mono">${escapeHtml(r.numeroFactura||'')}</td>
+      <td class="mono">${escapeHtml(numeroDoc_(r))}</td>
       <td class="mono">${fmtMoney(r.importe)}</td>
     </tr>`).join('');
-    $('#confirmar-pagos-overlay').dataset.lista = JSON.stringify(lista.map(r=>({fundacion:r.fundacion, rowNum:r._rowNum, proveedor:r.proveedor})));
+    $('#confirmar-pagos-overlay').dataset.lista = JSON.stringify(lista.map(r=>({kind:r.tipo==='factura'?'factura':'otro', fundacion:r.fundacion, rowNum:r._rowNum, proveedor:r.proveedor})));
     $('#confirmar-pagos-overlay').dataset.banco = banco || '';
     $('#confirmar-pagos-overlay').querySelector('.hint').textContent = banco
       ? `Se tildaron todas por defecto y se van a marcar como pagadas vía "${banco}". Destildá las que no correspondan antes de confirmar.`
@@ -1699,7 +1766,7 @@
     $('#confirmar-pagos-aceptar').disabled = true;
     let ok=0, fallidos=0;
     for(const item of marcar){
-      try{ await runServer('confirmarPagoConBanco', item.fundacion, item.rowNum, banco); ok++; }
+      try{ await runServer('confirmarPagoRouterConBanco', item.kind||'factura', item.fundacion, item.rowNum, banco, item.proveedor||''); ok++; registrarPagadoLocal_(claveRegistro_(item.fundacion, item.kind||'factura', item.rowNum), true); }
       catch(err){ fallidos++; }
     }
     $('#confirmar-pagos-aceptar').disabled = false;
@@ -1715,9 +1782,9 @@
     const filas = sel.map(r=>{
       const match = findAgendaMatch(r.proveedor, r.cuit);
       const cbu = match? match.cbu : '';
-      const numCorto = facturaNumeroCorto(r.numeroFactura);
-      const descripcion = ('FC '+numCorto).slice(0,12);
-      const mensajeFallback = ('OP - '+cbu+'- FCFactura - FC '+numCorto+' - $'+Math.round(Number(r.importe)||0));
+      const numCorto = facturaNumeroCorto(numeroDoc_(r));
+      const descripcion = ((r.tipo==='compra'?'OC ':'FC ')+numCorto).slice(0,12);
+      const mensajeFallback = ('OP - '+cbu+(r.tipo==='compra'?'- Compra - OC ':'- FCFactura - FC ')+numCorto+' - $'+Math.round(Number(r.importe)||0));
       const mensaje = (r.nombreArchivoPdf || mensajeFallback).slice(0,200);
       return {
         'CBU/CVU/Alias/Nro cuenta': cbu,
@@ -1742,6 +1809,7 @@
   async function marcarPdfsComoOpFinalizada(seleccionadas){
     const faltantes = [];
     for(const r of seleccionadas){
+      if(r.tipo!=='factura') continue; // las compras no tienen PDF en la carpeta de Mariana
       try{
         const res = await runServer('marcarOpFinalizada', r.fundacion, r._rowNum);
         if(!res || !res.ok) faltantes.push(r.proveedor);
@@ -1788,12 +1856,12 @@
       if(!esNumerico){ sinCbu.push(r.proveedor); return; }
       const cuitDigits = (r.cuit||'').replace(/[^0-9]/g,'');
       const modalidad = cbuDigits.indexOf('0285')===0 ? '02' : '04'; // 02: cuenta Macro, 04: otros bancos
-      const numCorto = facturaNumeroCorto(r.numeroFactura);
+      const numCorto = facturaNumeroCorto(numeroDoc_(r));
       filas.push({
         'Modalidad de Pago': modalidad,
         'Número de documento Beneficiario': cuitDigits,
         'Denominación del Beneficiario': (r.proveedor||'').slice(0,120),
-        'Identificación del pago': ('FC '+numCorto).slice(0,30),
+        'Identificación del pago': ((r.tipo==='compra'?'OC ':'FC ')+numCorto).slice(0,30),
         'Importe': Number(r.importe)||0,
         'Cuenta de pago - Nro/CBU o Nº Cheque': cbuDigits,
         'Marca de registración de cheque': '',
@@ -1865,9 +1933,9 @@
     const filas = sel.map(r=>{
       const match = findAgendaMatch(r.proveedor, r.cuit);
       const cbu = match? match.cbu : '';
-      const numCorto = facturaNumeroCorto(r.numeroFactura);
-      const descripcion = ('FC '+numCorto).slice(0,12);
-      const mensajeFallback = ('OP - '+cbu+'- FCFactura - FC '+numCorto+' - $'+Math.round(Number(r.importe)||0));
+      const numCorto = facturaNumeroCorto(numeroDoc_(r));
+      const descripcion = ((r.tipo==='compra'?'OC ':'FC ')+numCorto).slice(0,12);
+      const mensajeFallback = ('OP - '+cbu+(r.tipo==='compra'?'- Compra - OC ':'- FCFactura - FC ')+numCorto+' - $'+Math.round(Number(r.importe)||0));
       const mensaje = (r.nombreArchivoPdf || mensajeFallback).slice(0,200);
       return {
         'CBU/CVU/Alias/Nro cuenta': cbu,
@@ -1909,7 +1977,7 @@
           importe: Number(r.importe)||0,
           cuit: r.cuit||'',
           nombre: r.proveedor||'',
-          referencia: ('FC '+facturaNumeroCorto(r.numeroFactura)).slice(0,15),
+          referencia: ((r.tipo==='compra'?'OC ':'FC ')+facturaNumeroCorto(numeroDoc_(r))).slice(0,15),
           _rec: r
         };
       });

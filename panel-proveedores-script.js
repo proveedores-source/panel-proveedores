@@ -32,12 +32,12 @@
       google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn](...args);
     });
     const timeout = new Promise((_, reject)=>{
-      setTimeout(()=>reject(new Error('Se agotó el tiempo de espera (90s) para '+fn+'.')), 90000);
+      setTimeout(()=>reject(new Error('Se agotó el tiempo de espera (25s) para '+fn+'.')), 25000);
     });
     return Promise.race([llamada, timeout]);
   }
 
-  const CLIENT_VERSION = 'v2026-10-29d-compras-viejas-transf'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-11-06-completo'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -110,55 +110,7 @@
   }
   async function cargarLogSiHaceFalta(){ if(!logCargado) await cargarLog_(); }
 
-  /* ---- Cambios de "Pagado" recién hechos desde el panel ----
-     Se recuerdan unos minutos y se vuelven a aplicar sobre los datos que
-     llegan del servidor, para que una recarga que empezó ANTES de guardar
-     (o una lectura cacheada del servidor) no "destilde" la casilla sola. */
-  // Clave única por registro: incluye si es factura (MDG/RVP) u "otro"
-  // (Otros MDG/RVP), porque la fila 5 de MDG y la fila 5 de Otros MDG
-  // son registros distintos y antes compartían la misma clave.
-  function claveRegistro_(fund, kind, rowNum){ return fund+':'+(kind==='factura'?'f':'o')+':'+rowNum; }
-  function numeroDoc_(r){ return r.tipo==='factura' ? (r.numeroFactura||'') : (r.numeroComprobante||''); }
-  const pagadoOverrides = {}; // key -> { pagado, ts }
-  const OVERRIDE_MS = 6*60*1000;
-  function registrarPagadoLocal_(key, pagado){
-    pagadoOverrides[key] = { pagado: !!pagado, ts: Date.now() };
-    const r = records.find(x=>x._key===key);
-    if(r) aplicarPagado_(r, !!pagado);
-  }
-  function aplicarPagado_(r, pagado){
-    r.pagado = pagado;
-    if(r.estado==='eliminado') return;
-    if(pagado){ r.estado='completado'; if(!r.fechaResuelta) r.fechaResuelta=todayISO(); }
-    else if(r.estado==='completado'){ r.estado='pendiente'; r.fechaResuelta=''; }
-  }
-  function normalizarRecords_(){
-    const ahora = Date.now();
-    records.forEach(r=>{
-      const ov = pagadoOverrides[r._key];
-      if(ov){
-        if(ahora-ov.ts > OVERRIDE_MS || !!r.pagado===ov.pagado) delete pagadoOverrides[r._key];
-        else aplicarPagado_(r, ov.pagado);
-      }
-      // Si la columna "Pagado" está tildada, se considera completado
-      // (también para compras/presupuestos, no solo facturas).
-      if(r.pagado && r.estado!=='eliminado') r.estado='completado';
-    });
-  }
-
-  /* Evita que dos recargas se pisen: si llega un pedido mientras otra
-     recarga está en curso, se hace UNA recarga más al terminar, y la
-     recarga vieja no pinta datos desactualizados. */
-  let refreshEnCurso = null, refreshPendiente = false;
   async function refreshAll(){
-    if(refreshEnCurso){ refreshPendiente = true; return refreshEnCurso; }
-    refreshEnCurso = (async()=>{
-      do { refreshPendiente = false; await refreshAllInterno_(); } while(refreshPendiente);
-    })();
-    try{ await refreshEnCurso; } finally { refreshEnCurso = null; }
-  }
-
-  async function refreshAllInterno_(){
     cargaInicialCompleta = false;
     const fallidas = [];
     const tiempos = [];
@@ -177,6 +129,7 @@
       const version = metaR.value.appVersion || '(sin versión)';
       $('#me-chip').textContent = (miEmail ? ('👤 '+miEmail) : '👤 Usuario no identificado') + '  ·  '+version;
       $('#tab-usuarios').style.display = soyAdmin ? '' : 'none';
+      $('#btn-backups').style.display = soyAdmin ? '' : 'none';
     } else fallidas.push('usuario ('+(metaR.error&&metaR.error.message||'error')+')');
 
     async function cargarRecordsPaginado_(fuente){
@@ -198,8 +151,7 @@
     // Las "eliminadas" ya no se filtran acá globalmente — cada vista decide
     // si las excluye (Tablero/Dashboard/Transferencias siempre las excluyen)
     // o si las muestra (Listado tiene un selector Activas/Eliminadas/Todas).
-    records.forEach(r=>{ r._key = (r.fundacion && r._rowNum) ? claveRegistro_(r.fundacion, r.tipo==='factura'?'factura':'otro', r._rowNum) : r.id; });
-    normalizarRecords_();
+    records.forEach(r=>{ r._key = r.fundacion ? (r.fundacion+':'+r._rowNum) : r.id; });
     if(!mdgR.ok) fallidas.push('facturas MDG ('+(mdgR.error&&mdgR.error.message||'error')+')');
     if(!rvpR.ok) fallidas.push('facturas RVP ('+(rvpR.error&&rvpR.error.message||'error')+')');
     if(!otrosR.ok) fallidas.push('otros registros ('+(otrosR.error&&otrosR.error.message||'error')+')');
@@ -231,7 +183,6 @@
     $('#diagnostico-carga-texto').textContent = 'Total: '+(totalMs/1000).toFixed(1)+'s\n'+tiempos.join('\n');
     $('#me-chip').textContent += '  ·  cliente: '+CLIENT_VERSION+'  ·  facturas: '+records.length+'  ·  carga: '+(totalMs/1000).toFixed(1)+'s';
 
-    if(refreshPendiente) return; // viene otra recarga más nueva: no pintar datos viejos
     renderAll();
     if(soyAdmin) refreshUsuarios();
     cargaInicialCompleta = true;
@@ -520,8 +471,11 @@
       };
     }
     try{
-      await runServer('addRecord', rec);
+      const resAdd = await runServer('addRecord', rec);
       showToast('Registro guardado.');
+      if(resAdd && resAdd.alertaImporte){
+        alert('⚠ IMPORTE A AUTORIZAR\n\nLa factura quedó guardada pero RETENIDA: '+resAdd.alertaImporte+'.\n\nNo se va a poder pagar hasta que un administrador (distinto de quien la cargó) la autorice. Ya se les avisó por mail.');
+      }
       e.target.reset();
       $('#review-form').style.display='none';
       $('#paste-text').value=''; $('#file-input').value=''; $('#file-name').textContent='';
@@ -564,6 +518,9 @@
     const overdue = r.estado!=='completado' && d>7;
     const srcColor = r.fuente==='whatsapp'?'var(--src-wa)':(r.fuente==='presencial'?'var(--src-pres)':'var(--src-email)');
     const historica = !r.isAppRecord;
+    const parcial = (r.tipo==='factura' && Number(r.cancelado)>0 && Number(r.saldo)>0) ? `<span class="ticket-tag" style="background:var(--media-soft);color:#7A5615;">A cuenta · saldo ${fmtMoney(r.saldo)}</span>` : '';
+    const ctrlEst = ctrlImporteEstado_(r);
+    const ctrlBadge = ctrlEst==='pendiente' ? '<span class="ticket-tag" style="background:var(--alta-soft);color:var(--alta);">⚠ Importe a autorizar</span>' : (ctrlEst==='autorizado' ? '<span class="ticket-tag" style="background:var(--baja-soft);color:var(--baja);">✓ Importe autorizado</span>' : '');
     const fundBadge = r.fundacion ? `<span class="ticket-tag" style="background:${r.fundacion==='mdg'?'var(--accent-soft)':'var(--media-soft)'};color:${r.fundacion==='mdg'?'var(--accent-dark)':'#7A5615'};">${r.fundacion.toUpperCase()}</span>` : '';
     return `<div class="ticket-card" data-prio="${r.prioridad}" draggable="true" data-id="${r._key||''}">
       <div class="ticket-stub">
@@ -572,7 +529,7 @@
       </div>
       <div class="ticket-tear"></div>
       <div class="ticket-body">
-        ${fundBadge}<span class="ticket-tag">${TIPO_LABEL[r.tipo]||r.tipo}</span>
+        ${fundBadge}${ctrlBadge}${parcial}<span class="ticket-tag">${TIPO_LABEL[r.tipo]||r.tipo}</span>
         <div class="prov">${escapeHtml(r.proveedor||'—')}</div>
         <div class="desc">${escapeHtml(r.descripcion||'')}</div>
         <div class="ticket-meta">
@@ -610,8 +567,8 @@
       if(nuevoEstado!=='completado') patch.fechaResuelta = '';
       try{
         const kind = rec.tipo==='factura' ? 'factura' : 'otro';
-        if(!rec._rowNum && kind==='otro') await runServer('updateOtroLegacyRecord', rec.id, patch);
-        else await runServer('updateRecordRouter', kind, rec.fundacion||null, rec._rowNum, patch, `Movió "${rec.proveedor}" de ${ESTADO_LABEL[rec.estado]} a ${ESTADO_LABEL[nuevoEstado]}`);
+        const idOrRow = (kind==='factura' || (rec.fundacion && rec._rowNum)) ? rec._rowNum : rec.id;
+        await runServer('updateRecordRouter', kind, rec.fundacion||null, idOrRow, patch, `Movió "${rec.proveedor}" de ${ESTADO_LABEL[rec.estado]} a ${ESTADO_LABEL[nuevoEstado]}`);
         showToast('Movido a '+ESTADO_LABEL[nuevoEstado]+'.');
         refreshAll();
       }catch(err){ showToast('No se pudo mover: '+(err.message||'error')); }
@@ -619,17 +576,24 @@
   });
 
   /* ---------------- EDIT MODAL ---------------- */
-  let editingId=null, editingKind='otro', editingFundacion=null, editingLegacy=false;
-  // Sin esto, un campo obligatorio oculto del formulario bloqueaba "Guardar" sin avisar nada.
-  $('#edit-form').setAttribute('novalidate','');
+  let editingId=null, editingKind='otro', editingFundacion=null, editOriginalPrio='media';
+  function importePend_(r){ return (r.tipo==='factura' && r.saldo!=null) ? (Number(r.saldo)||0) : (Number(r.importe)||0); }
+  function ctrlImporteEstado_(r){ const v=String((r&&r.controlImporte)||''); return v.indexOf('PENDIENTE')===0 ? 'pendiente' : (v.indexOf('AUTORIZADO')===0 ? 'autorizado' : ''); }
+  function fmtFechaAR_(iso){ const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(iso||''); return m ? (m[3]+'/'+m[2]+'/'+m[1]) : (iso||''); }
+  function cambioPrioVisible_(){ return editOriginalPrio==='alta' && editSelectedPrio!=='alta'; }
+  function actualizarCambioPrio_(){
+    const visible = cambioPrioVisible_();
+    $('#e-cambioprio-wrap').classList.toggle('hidden', !visible);
+    if(!visible){ $('#e-cp-preview').textContent=''; return; }
+    const quien=$('#e-cp-quien').value.trim(), medio=$('#e-cp-medio').value, fecha=$('#e-cp-fecha').value;
+    $('#e-cp-preview').textContent = 'Quedará registrado: «Prioridad bajada de alta a '+editSelectedPrio+' el '+(fmtFechaAR_(fecha)||'[fecha]')+' con autorización de '+(quien||'[nombre y área]')+', confirmada por '+(medio||'[mail / WhatsApp / en persona]')+'.»';
+  }
+  ['e-cp-quien','e-cp-medio','e-cp-fecha'].forEach(id=>{ const el=document.getElementById(id); el.addEventListener('input',actualizarCambioPrio_); el.addEventListener('change',actualizarCambioPrio_); });
   function openEditModal(key){
     const r = records.find(x=>x._key===key); if(!r) return;
     editingKind = r.tipo==='factura' ? 'factura' : 'otro';
     editingFundacion = r.fundacion || null;
-    // Facturas y Otros MDG/RVP se identifican por fila. Los registros de la
-    // hoja vieja "Otros" no tienen fila propia: se identifican por su id.
-    editingLegacy = !r._rowNum && editingKind==='otro';
-    editingId = r._rowNum || (editingLegacy ? r.id : null);
+    editingId = (editingKind==='factura' || (r.fundacion && r._rowNum)) ? r._rowNum : r.id;
     $('#e-tipo').value=r.tipo; $('#e-fuente').value=r.fuente||'email'; $('#e-proveedor').value=r.proveedor||'';
     $('#e-cuit').value=formatearCuit_(r.cuit||''); $('#e-importe').value=r.importe||'';
     $('#e-numfactura').value=r.numeroFactura||''; $('#e-cae').value=r.cae||'';
@@ -641,6 +605,26 @@
     $('#e-fecharesuelta').value=r.fechaResuelta||''; $('#e-estado').value=r.estado;
     editSelectedPrio=r.prioridad;
     $$('#e-prio-select .prio-opt').forEach(o=>o.classList.toggle('selected', o.dataset.p===editSelectedPrio));
+    editOriginalPrio = r.prioridad || 'media';
+    cargarPagosModal_(r);
+    (function(){
+      const est = ctrlImporteEstado_(r), wrap = $('#e-ctrl-wrap');
+      wrap.classList.toggle('hidden', !est);
+      $('#e-ctrl-autorizar').classList.toggle('hidden', !(est==='pendiente' && soyAdmin && r.tipo==='factura'));
+      if(est){
+        const pend = est==='pendiente';
+        wrap.style.background = pend ? 'var(--alta-soft)' : 'var(--baja-soft)';
+        wrap.style.border = '1px solid ' + (pend ? 'var(--alta)' : 'var(--baja)');
+        const detalle = escapeHtml(String(r.controlImporte).replace(/^(PENDIENTE|AUTORIZADO)\s*/,'').replace(/^\|\s*/,''));
+        $('#e-ctrl-txt').innerHTML = pend
+          ? '<b>⚠ Importe a autorizar — factura retenida.</b> No se puede pagar ni pasar a Completado hasta que un administrador (distinto de quien la cargó) la autorice.<br><span style="color:var(--ink-soft)">'+detalle+'</span>'
+          : '<b>✓ Importe autorizado.</b><br><span style="color:var(--ink-soft)">'+detalle+'</span>';
+      }
+    })();
+    $('#e-cp-fecha').value = todayISO(); $('#e-cp-medio').value=''; $('#e-cp-quien').value='';
+    $('#e-cambioprio-hist').classList.toggle('hidden', !r.cambioPrioridad);
+    $('#e-cambioprio-hist-txt').innerHTML = (r.cambioPrioridad||'').split(' | ').filter(Boolean).map(t=>'• '+escapeHtml(t)).join('<br>');
+    actualizarCambioPrio_();
     $('#e-factura-fields').style.display = r.tipo==='factura'?'grid':'none';
     $('#e-numcomprobante-wrap').style.display = (r.tipo==='compra' || r.tipo==='presupuesto') ? 'grid' : 'none';
     $('#e-fundacion-otros-wrap').style.display = editingKind==='otro' ? 'grid' : 'none';
@@ -653,15 +637,58 @@
     $('#e-fundacion-otros-wrap').style.display = esFactura ? 'none' : 'grid';
     $('#e-numcomprobante-wrap').style.display = (tipoVal==='compra' || tipoVal==='presupuesto') ? 'grid' : 'none';
   });
-  $('#e-prio-select').addEventListener('click',(e)=>{ const o=e.target.closest('.prio-opt'); if(!o) return; editSelectedPrio=o.dataset.p; $$('#e-prio-select .prio-opt').forEach(x=>x.classList.toggle('selected',x===o)); });
+  $('#e-prio-select').addEventListener('click',(e)=>{ const o=e.target.closest('.prio-opt'); if(!o) return; editSelectedPrio=o.dataset.p; $$('#e-prio-select .prio-opt').forEach(x=>x.classList.toggle('selected',x===o)); actualizarCambioPrio_(); });
   function closeModal(){ $('#modal-overlay').classList.add('hidden'); editingId=null; }
+  async function cargarPagosModal_(r){
+    const wrap = $('#e-pagos-wrap');
+    const esFactura = r.tipo==='factura' && r.fundacion && r._rowNum;
+    wrap.classList.toggle('hidden', !esFactura);
+    if(!esFactura) return;
+    const saldo = Number(r.saldo)||0, cancelado = Number(r.cancelado)||0, completa = !!r.pagado || r.estado==='eliminado';
+    $('#e-pagos-resumen').innerHTML = 'Importe '+fmtMoney(r.importe)+' · Registrado '+fmtMoney(cancelado)+' · <b style="color:'+(saldo>0?'var(--alta)':'var(--baja)')+'">Saldo '+fmtMoney(saldo)+'</b>'+(r.pagado?' · ✓ pagada':'');
+    $('#e-pagos-form').classList.toggle('hidden', completa);
+    $('#e-pg-fecha').value = todayISO(); $('#e-pg-concepto').value='Pago'; $('#e-pg-importe').value = saldo>0 ? saldo : ''; $('#e-pg-medio').value=''; $('#e-pg-nota').value='';
+    $('#e-pg-medios').innerHTML = (mediosPago||[]).map(m=>'<option value="'+escapeHtml(m.medioDePago)+'">').join('');
+    const lista = $('#e-pagos-lista'); lista.innerHTML = '';
+    if(cancelado<=0 && !r.pagado) return;
+    lista.innerHTML = '<span class="hint">Cargando movimientos…</span>';
+    try{
+      const pagos = await runServer('getPagosDeFactura', r.fundacion, r._rowNum);
+      lista.innerHTML = pagos.length ? pagos.map(p=>'<div style="display:flex;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:4px 0;"><span>'+escapeHtml(fmtFechaAR_(p.fecha))+' · <b>'+escapeHtml(p.concepto)+'</b> '+fmtMoney(p.importe)+(p.medioDePago?' · '+escapeHtml(p.medioDePago):'')+(p.nota?' · <i>'+escapeHtml(p.nota)+'</i>':'')+'</span>'+(soyAdmin?'<button type="button" class="btn-ghost" data-del-pago="'+escapeHtml(p.id)+'">quitar</button>':'')+'</div>').join('') : '';
+      $$('[data-del-pago]').forEach(b=>b.addEventListener('click', async ()=>{
+        if(!confirm('¿Quitar este movimiento? Si con él se había cerrado la factura, vuelve a quedar con saldo pendiente.')) return;
+        try{ await runServer('eliminarPagoParcial', b.dataset.delPago); showToast('Movimiento quitado.'); closeModal(); refreshAll(); }
+        catch(err){ showToast(err.message||'No se pudo quitar.'); }
+      }));
+    }catch(err){ lista.innerHTML=''; }
+  }
+  $('#e-pg-medio').addEventListener('input', ()=>$('#e-pg-usd-hint').classList.toggle('hidden', !/U\$S/i.test($('#e-pg-medio').value)));
+  $('#e-pg-registrar').addEventListener('click', async ()=>{
+    if(!editingId || editingKind!=='factura') return;
+    const datos = { fecha:$('#e-pg-fecha').value, concepto:$('#e-pg-concepto').value, importe:Number($('#e-pg-importe').value)||0, medioDePago:$('#e-pg-medio').value.trim(), nota:$('#e-pg-nota').value.trim() };
+    if(!(datos.importe>0)){ showToast('Ingresá un importe mayor a cero.'); return; }
+    const btn = $('#e-pg-registrar'); btn.disabled = true;
+    try{
+      const res = await runServer('registrarPagoParcial', editingFundacion, editingId, datos);
+      showToast(res.completado ? 'Registrado. Saldo $0: la factura quedó pagada por completo.' : 'Registrado. Saldo pendiente: '+fmtMoney(res.saldo));
+      closeModal(); refreshAll();
+    }catch(err){ showToast(err.message||'No se pudo registrar.'); }
+    btn.disabled = false;
+  });
+  $('#e-ctrl-autorizar').addEventListener('click', async ()=>{
+    if(!editingId || editingKind!=='factura') return;
+    const nota = prompt('Vas a autorizar el pago de esta factura con importe fuera de lo habitual.\n\nNota opcional (ej: "confirmado con Dirección por mail"):');
+    if(nota===null) return;
+    try{ await runServer('autorizarImporte', editingFundacion, editingId, nota); showToast('Importe autorizado.'); closeModal(); refreshAll(); }
+    catch(err){ showToast(err.message||'No se pudo autorizar.'); }
+  });
   $('#modal-close').addEventListener('click', closeModal);
   $('#btn-cancel-edit').addEventListener('click', closeModal);
   $('#modal-overlay').addEventListener('click',(e)=>{ if(e.target.id==='modal-overlay') closeModal(); });
 
   $('#edit-form').addEventListener('submit', async (e)=>{
     e.preventDefault();
-    if(!editingId){ showToast('No se pudo identificar este registro. Recargá el panel y probá de nuevo.'); return; }
+    if(!editingId) return;
     const tipo = $('#e-tipo').value;
     const proveedorNuevo = $('#e-proveedor').value.trim();
     const patch = editingKind==='factura' ? {
@@ -684,12 +711,17 @@
       fechaResuelta:$('#e-fecharesuelta').value||'',
       prioridad: editSelectedPrio, estado:$('#e-estado').value
     };
+    if(cambioPrioVisible_()){
+      const cp = { fecha:$('#e-cp-fecha').value, autorizadoPor:$('#e-cp-quien').value.trim(), confirmadoPor:$('#e-cp-medio').value };
+      if(!cp.fecha || !cp.autorizadoPor || !cp.confirmadoPor){
+        showToast('Para bajar una prioridad Alta completá: fecha, quién lo autorizó (nombre y área) y cómo se confirmó.');
+        return;
+      }
+      patch.cambioPrioridad = cp;
+    }
     try{
-      if(editingLegacy) await runServer('updateOtroLegacyRecord', editingId, patch);
-      else await runServer('updateRecordRouter', editingKind, editingFundacion, editingId, patch, `Editó registro de "${proveedorNuevo}"`);
-      const rLocal = records.find(x=> editingLegacy ? x.id===editingId : (x._rowNum===editingId && x.fundacion===editingFundacion && (x.tipo==='factura')===(editingKind==='factura')));
-      if(rLocal){ rLocal.estado = patch.estado; if(patch.fechaResuelta!==undefined) rLocal.fechaResuelta = patch.fechaResuelta; rLocal.prioridad = patch.prioridad; }
-      showToast('Cambios guardados.'); closeModal(); renderAll(); refreshAll();
+      await runServer('updateRecordRouter', editingKind, editingFundacion, editingId, patch, `Editó registro de "${proveedorNuevo}"`);
+      showToast('Cambios guardados.'); closeModal(); refreshAll();
     }catch(err){ showToast('No se pudo guardar: '+(err.message||'error')); }
   });
   $('#btn-delete').addEventListener('click', async ()=>{
@@ -698,7 +730,7 @@
       ? '¿Eliminar esta factura del panel? No se borra la fila de la planilla real (se mantiene para el registro contable de Mariana), pero deja de mostrarse en Tablero, Listado y Dashboard.'
       : '¿Eliminar este registro? No se puede deshacer.';
     if(confirm(msg)){
-      try{ if(editingLegacy) await runServer('deleteOtroLegacyRecord', editingId); else await runServer('deleteRecordRouter', editingKind, editingFundacion, editingId); showToast('Eliminado del panel.'); closeModal(); refreshAll(); }
+      try{ await runServer('deleteRecordRouter', editingKind, editingFundacion, editingId); showToast('Eliminado del panel.'); closeModal(); refreshAll(); }
       catch(err){ showToast('No se pudo completar: '+(err.message||'error')); }
     }
   });
@@ -748,7 +780,7 @@
     const compras = recs.filter(r=>r.tipo==='compra');
     const presupuestos = recs.filter(r=>r.tipo==='presupuesto');
     const pendientesTodos = recs.filter(r=>r.estado!=='completado');
-    const importePend = pendientesTodos.reduce((s,r)=>s+(Number(r.importe)||0),0);
+    const importePend = pendientesTodos.reduce((s,r)=>s+importePend_(r),0);
     const resueltosRecs = recs.filter(r=>r.estado==='completado' && r.fechaRecibida && r.fechaResuelta);
     const diasValidos = resueltosRecs.map(r=>daysBetween(r.fechaRecibida, r.fechaResuelta)).filter(d=>Number.isFinite(d));
     const avgDays = diasValidos.length ? Math.round(diasValidos.reduce((s,d)=>s+d,0)/diasValidos.length) : null;
@@ -903,7 +935,7 @@
   $('#btn-listado-exportar').addEventListener('click', ()=>{
     const filas = getListadoFiltered();
     if(!filas.length){ showToast('No hay filas para exportar con los filtros actuales.'); return; }
-    const headers = ['Fuente','Fundación','Pagado','Tipo','Proveedor','CUIT','Tipo Factura','N° Factura','Fecha Emisión','Descripción','Importe','CAE','Medio de Pago','Centro de Costo','Clasificación Flujo','Prioridad','Estado','Cargado Por','Fecha Recibida','Fecha Resuelta'];
+    const headers = ['Fuente','Fundación','Pagado','Tipo','Proveedor','CUIT','Tipo Factura','N° Factura','Fecha Emisión','Descripción','Importe','CAE','Medio de Pago','Centro de Costo','Clasificación Flujo','Prioridad','Estado','Cargado Por','Fecha Recibida','Fecha Resuelta','Cambio de prioridad autorizado','Control de importe','Pagado/cancelado','Saldo'];
     const datos = filas.map(r=>({
       'Fuente': r.fuente?(FUENTE_LABEL[r.fuente]||r.fuente):'',
       'Fundación': r.fundacion?r.fundacion.toUpperCase():'',
@@ -924,7 +956,11 @@
       'Estado': ESTADO_LABEL[r.estado]||r.estado||'',
       'Cargado Por': r.cargadoPor||'',
       'Fecha Recibida': r.fechaRecibida||'',
-      'Fecha Resuelta': r.fechaResuelta||''
+      'Fecha Resuelta': r.fechaResuelta||'',
+      'Cambio de prioridad autorizado': r.cambioPrioridad||'',
+      'Control de importe': r.controlImporte||'',
+      'Pagado/cancelado': r.tipo==='factura' ? (Number(r.cancelado)||0) : '',
+      'Saldo': r.tipo==='factura' ? (Number(r.saldo)||0) : ''
     }));
     const ws = XLSX.utils.json_to_sheet(datos, {header: headers});
     ws['!autofilter'] = { ref: ws['!ref'] };
@@ -955,27 +991,12 @@
       <td class="row-actions sticky-col">${r._key? `<button class="btn" data-edit="${r._key}">Editar</button>` : ''}</td>
       <td class="mono">${fmtDateShort(r.fechaRecibida)}</td>
       <td class="mono">${fmtDateShort(r.fechaResuelta)}</td><td>${ESTADO_LABEL[r.estado]||r.estado}</td>
-      <td class="mono">${escapeHtml(r.cae)}</td><td>${escapeHtml(r.clasificacionFlujo)}</td><td>${escapeHtml(r.cargadoPor)}</td></tr>`;
+      <td class="mono">${escapeHtml(r.cae)}</td><td>${escapeHtml(r.clasificacionFlujo)}</td><td>${escapeHtml(r.cargadoPor)}</td><td style="white-space:normal;min-width:240px;font-size:11.5px;">${escapeHtml(r.cambioPrioridad||'')}</td><td style="white-space:normal;min-width:200px;font-size:11.5px;">${ctrlImporteEstado_(r)==='pendiente'?'<b style="color:var(--alta)">⚠ A AUTORIZAR</b> ':''}${escapeHtml(String(r.controlImporte||'').replace(/^(PENDIENTE|AUTORIZADO)/, m=>m==='AUTORIZADO'?'✓ AUTORIZADO':'').replace(/^\s*\|\s*/,''))}</td><td class="mono">${(r.tipo==='factura' && Number(r.cancelado)>0) ? fmtMoney(r.saldo) : ''}</td></tr>`;
     }).join('');
     $$('[data-pagado]').forEach(chk=>chk.addEventListener('change', async ()=>{
       const [kind, fund, rowNum] = chk.dataset.pagado.split(':');
-      const key = claveRegistro_(fund, kind, rowNum);
-      const recChk = records.find(x=>x._key===key);
-      const valor = chk.checked;
-      const previo = !valor;
-      chk.disabled = true;
-      registrarPagadoLocal_(key, valor);
-      try{
-        await runServer('setPagadoRouter', kind, fund, parseInt(rowNum,10), valor, recChk?recChk.proveedor:'');
-        showToast(valor?'Marcado como pagado/completado.':'Desmarcado.');
-        renderAll();
-        refreshAll();
-      }catch(err){
-        registrarPagadoLocal_(key, previo);
-        delete pagadoOverrides[key];
-        showToast('Error: '+(err.message||''));
-        renderAll();
-      }
+      try{ await runServer('setPagadoRouter', kind, fund, parseInt(rowNum,10), chk.checked); showToast(chk.checked?'Marcado como pagado/completado.':'Desmarcado.'); refreshAll(); }
+      catch(err){ showToast('Error: '+(err.message||'')); chk.checked = !chk.checked; }
     }));
     $$('[data-edit]').forEach(b=>b.addEventListener('click',()=>openEditModal(b.dataset.edit)));
   }
@@ -1137,17 +1158,20 @@
 
   /* ---------------- COUNTERS ---------------- */
   function renderCounters(){
-    const activos = records.filter(r=>r.estado!=='eliminado');
-    const pendRecs = activos.filter(r=>r.estado!=='completado');
-    const facturasPendRecs = activos.filter(r=>r.tipo==='factura' && r.estado!=='completado');
-    const overdueRecs = activos.filter(r=>r.estado!=='completado' && daysBetween(r.fechaRecibida, todayISO())>7);
-    const importePend = pendRecs.reduce((s,r)=>s+(Number(r.importe)||0),0);
+    const pendRecs = records.filter(r=>r.estado!=='completado');
+    const facturasPendRecs = records.filter(r=>r.tipo==='factura' && r.estado!=='completado');
+    const overdueRecs = records.filter(r=>r.estado!=='completado' && daysBetween(r.fechaRecibida, todayISO())>7);
+    const importePend = pendRecs.reduce((s,r)=>s+importePend_(r),0);
     const chips = [
       {n:pendRecs.length, l:'Pendientes', lista:pendRecs, titulo:'Pendientes'},
       {n:facturasPendRecs.length, l:'Facturas x pagar', lista:facturasPendRecs, titulo:'Facturas por pagar'},
       {n:fmtMoney(importePend), l:'Importe pendiente', lista:pendRecs, titulo:'Importe pendiente'},
       {n:overdueRecs.length, l:'+7 días', warn:true, lista:overdueRecs, titulo:'Pendientes hace más de 7 días'}
     ];
+    const retenidas = records.filter(r=>r.tipo==='factura' && r.estado!=='eliminado' && ctrlImporteEstado_(r)==='pendiente');
+    if(retenidas.length) chips.unshift({n:retenidas.length, l:'Importes a autorizar', warn:true, lista:retenidas, titulo:'Facturas con importe a autorizar'});
+    const aCuenta = records.filter(r=>r.tipo==='factura' && r.estado!=='eliminado' && !r.pagado && Number(r.cancelado)>0 && Number(r.saldo)>0);
+    if(aCuenta.length) chips.push({n:aCuenta.length, l:'Con pago a cuenta', lista:aCuenta, titulo:'Facturas con pago a cuenta (saldo pendiente)'});
     $('#counters-strip').innerHTML = chips.map((c,i)=>`<div class="counter-chip ${c.warn?'warn':''}" style="cursor:pointer;" data-counter-idx="${i}"><span class="num">${c.n}</span><span class="lbl">${c.l}</span></div>`).join('');
     $$('#counters-strip [data-counter-idx]').forEach(el=>el.addEventListener('click', ()=>{
       const c = chips[parseInt(el.dataset.counterIdx,10)];
@@ -1158,9 +1182,9 @@
   /* ---------------- RESUMEN (manual) ---------------- */
   function buildSummaryHTML(){
     const today = todayISO();
-    const pendientes = records.filter(r=>r.estado!=='completado' && r.estado!=='eliminado');
+    const pendientes = records.filter(r=>r.estado!=='completado');
     const facturasPend = pendientes.filter(r=>r.tipo==='factura');
-    const importePend = pendientes.reduce((s,r)=>s+(Number(r.importe)||0),0);
+    const importePend = pendientes.reduce((s,r)=>s+importePend_(r),0);
     const masAntiguos = [...pendientes].sort((a,b)=>daysBetween(b.fechaRecibida,today)-daysBetween(a.fechaRecibida,today)).slice(0,5);
     const cargadosHoy = records.filter(r=>r.fechaRecibida===today);
     const resueltosHoy = records.filter(r=>r.fechaResuelta===today);
@@ -1249,6 +1273,58 @@
   $('#summary-close').addEventListener('click', ()=>$('#summary-overlay').classList.add('hidden'));
   $('#summary-ok').addEventListener('click', ()=>$('#summary-overlay').classList.add('hidden'));
   $('#summary-overlay').addEventListener('click',(e)=>{ if(e.target.id==='summary-overlay') $('#summary-overlay').classList.add('hidden'); });
+
+  /* ---------------- COPIAS DE SEGURIDAD (solo admins) ---------------- */
+  let backupFolderUrl = '';
+  function fmtFechaHoraAR_(iso){ if(!iso) return '—'; const d=new Date(iso); return isNaN(d) ? String(iso) : d.toLocaleString('es-AR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}); }
+  async function cargarBackups_(){
+    const box = $('#backup-content');
+    box.innerHTML = '<div class="hint"><span class="spinner"></span>Leyendo copias…</div>';
+    try{
+      const info = await runServer('getBackupInfo');
+      backupFolderUrl = info.folderUrl || '';
+      $('#backup-abrir-carpeta').disabled = !backupFolderUrl;
+      if(!info.configurado){
+        box.innerHTML = '<div class="alert-banner">Todavía no está activada. Un administrador tiene que ejecutar <b>crearDisparadorBackup</b> una vez desde el editor de Apps Script (crea la carpeta y programa la copia diaria).</div>';
+        return;
+      }
+      const u = info.ultimo;
+      let estado;
+      if(!u) estado = '<div class="alert-banner">Aún no hay ninguna copia registrada.</div>';
+      else if(!u.ok) estado = '<div class="alert-banner" style="background:var(--alta-soft);border-color:var(--alta);color:var(--alta);">⚠ El último intento falló ('+fmtFechaHoraAR_(u.ts)+'): '+escapeHtml(u.error||'error')+'</div>';
+      else {
+        const horas = (Date.now()-new Date(u.ts).getTime())/3600000;
+        estado = horas>36
+          ? '<div class="alert-banner">⚠ La última copia exitosa fue el '+fmtFechaHoraAR_(u.ts)+' (hace más de un día y medio). Revisá que el disparador siga activo.</div>'
+          : '<div style="font-size:13px;margin-bottom:10px;">✅ Última copia: <b>'+fmtFechaHoraAR_(u.ts)+'</b></div>';
+      }
+      let lista = '';
+      if(info.sinAcceso) lista = '<div class="hint">Tu cuenta no tiene acceso a la carpeta para listar las copias. Pedile a quien la creó que la comparta con vos.</div>';
+      else if(!info.backups.length) lista = '<div class="empty-state">No hay copias en la carpeta todavía.</div>';
+      else lista = '<div class="table-wrap" style="max-height:240px;"><table><thead><tr><th>Copia</th><th>Creada</th><th></th></tr></thead><tbody>'
+        + info.backups.map(b=>'<tr><td style="white-space:normal;">'+escapeHtml(b.nombre.replace('Backup Facturas Procesadas - ',''))+'</td><td class="mono">'+fmtFechaHoraAR_(b.fecha)+'</td><td><button class="btn" data-backup-url="'+escapeHtml(b.url)+'">Abrir</button></td></tr>').join('')
+        + '</tbody></table></div><div class="hint" style="margin-top:6px;">Se muestran las últimas '+info.backups.length+' de '+info.total+'. Se conservan '+info.retencionDias+' días.</div>';
+      box.innerHTML = estado + lista;
+      $$('[data-backup-url]').forEach(b=>b.addEventListener('click',()=>window.open(b.dataset.backupUrl,'_blank','noopener')));
+    }catch(err){
+      box.innerHTML = '<div class="alert-banner">No se pudo leer: '+escapeHtml(err.message||'error')+'</div>';
+    }
+  }
+  $('#btn-backups').addEventListener('click', ()=>{ $('#backup-overlay').classList.remove('hidden'); cargarBackups_(); });
+  $('#backup-close').addEventListener('click', ()=>$('#backup-overlay').classList.add('hidden'));
+  $('#backup-overlay').addEventListener('click',(e)=>{ if(e.target.id==='backup-overlay') $('#backup-overlay').classList.add('hidden'); });
+  $('#backup-abrir-carpeta').addEventListener('click', ()=>{ if(backupFolderUrl) window.open(backupFolderUrl,'_blank','noopener'); });
+  $('#backup-ahora').addEventListener('click', async ()=>{
+    const btn = $('#backup-ahora'); btn.disabled = true; const txt = btn.textContent;
+    btn.innerHTML = '<span class="spinner"></span>Copiando… (puede tardar un minuto)';
+    try{
+      // sin el límite de 25 s de runServer: copiar una planilla grande puede demorar más
+      const res = await new Promise((resolve,reject)=>google.script.run.withSuccessHandler(resolve).withFailureHandler(reject).ejecutarBackupAhora());
+      showToast('Copia creada: '+(res&&res.nombre||'ok'));
+    }catch(err){ showToast('No se pudo hacer la copia: '+(err.message||'error')); }
+    btn.disabled = false; btn.textContent = txt;
+    cargarBackups_();
+  });
 
   /* ---------------- AGENDA DE CONTACTOS ---------------- */
   let agenda = [];
@@ -1667,10 +1743,7 @@
     return sinCeros || last;
   }
   function getFacturasPendientesDePago(){
-    return records.filter(r => !r.pagado && r.estado!=='eliminado' && r.estado!=='completado' && (
-      (r.tipo==='factura' && r.fundacion && r._rowNum) ||
-      (r.tipo==='compra' && ((r.fundacion && r._rowNum) || (!r._rowNum && r.id)))   // compras nuevas (Otros MDG/RVP) y viejas (hoja "Otros")
-    ));
+    return records.filter(r => r.tipo==='factura' && !r.pagado && r.fundacion && r.estado!=='eliminado');
   }
   function getTransfFiltradas(){
     const fund = $('#transf-filt-fundacion').value;
@@ -1688,10 +1761,10 @@
     const datos = filas.map(r=>{
       const match = findAgendaMatch(r.proveedor, r.cuit);
       return {
-        'Fundación': (r.fundacion||'').toUpperCase(),
+        'Fundación': r.fundacion.toUpperCase(),
         'Proveedor': r.proveedor || '',
         'CUIT': r.cuit || '',
-        'N° Factura': numeroDoc_(r),
+        'N° Factura': r.numeroFactura || '',
         'Importe': Number(r.importe)||0,
         'Fecha Recibida': r.fechaRecibida || '',
         'CBU/CVU/Alias': match ? (match.cbu||'') : '',
@@ -1714,29 +1787,46 @@
     $('#transf-body').innerHTML = pendientes.map(r=>{
       const match = findAgendaMatch(r.proveedor, r.cuit);
       const tieneCbu = match && match.cbu;
+      const retenida = ctrlImporteEstado_(r)==='pendiente';
       return `<tr>
-        <td style="text-align:center"><input type="checkbox" class="transf-check" data-transfid="${r._key}" ${tieneCbu?'':'disabled'}></td>
-        <td>${(r.fundacion||'—').toUpperCase()}</td><td>${escapeHtml(r.proveedor)}</td><td class="mono">${escapeHtml(r.cuit)}</td>
-        <td class="mono">${r.tipo==='compra' ? '<span class="ticket-tag">Compra</span> ' : ''}${escapeHtml(numeroDoc_(r))}</td><td class="mono">${fmtMoney(r.importe)}</td>
+        <td style="text-align:center"><input type="checkbox" class="transf-check" data-transfid="${r.fundacion}:${r._rowNum}" ${retenida?'disabled':''}></td>
+        <td>${r.fundacion.toUpperCase()}</td><td>${escapeHtml(r.proveedor)}</td><td class="mono">${escapeHtml(r.cuit)}</td>
+        <td class="mono">${escapeHtml(r.numeroFactura)}</td><td class="mono">${fmtMoney(r.importe)}${Number(r.cancelado)>0 ? '<br><span style="color:var(--media);font-size:11px;">saldo '+fmtMoney(r.saldo)+'</span>' : ''}</td>
+        <td><input type="number" step="0.01" min="0" class="transf-apagar mono-input" style="width:120px;" data-transfid="${r.fundacion}:${r._rowNum}" value="${Number(r.saldo!=null?r.saldo:r.importe)||0}"></td>
         <td class="mono">${match? escapeHtml(match.cbu||'—') : '—'}</td>
         <td>${match? escapeHtml(match.email||'—') : '—'}</td>
-        <td>${tieneCbu? '<span style="color:var(--baja)">✓ OK</span>' : '<span style="color:var(--alta)">⚠ falta en Agenda</span>'}</td>
+        <td>${retenida ? '<span style="color:var(--alta)">🔒 Importe a autorizar</span>' : (tieneCbu? '<span style="color:var(--baja)">✓ OK</span>' : '<span style="color:var(--alta)" title="Sin CBU solo se puede pagar con Caja o Tarjeta, o completar la Agenda">⚠ sin CBU (solo Caja/Tarjeta)</span>')}</td>
         <td>${r._key? `<button class="btn" data-transf-edit="${r._key}">Ver / Editar</button>` : ''}</td>
       </tr>`;
     }).join('');
     $$('.transf-check').forEach(chk=>chk.addEventListener('change', updateTransfResumen));
+    $$('.transf-apagar').forEach(inp=>inp.addEventListener('input', updateTransfResumen));
     $$('[data-transf-edit]').forEach(btn=>btn.addEventListener('click', ()=>openEditModal(btn.dataset.transfEdit)));
     updateTransfResumen();
   }
   ['transf-filt-fundacion','transf-buscar'].forEach(id=>$('#'+id).addEventListener('input', renderTransferencias));
   $('#transf-filt-fundacion').addEventListener('change', renderTransferencias);
 
+  // Los archivos de banco necesitan CBU/CVU/alias en la Agenda; Caja/Tarjeta/Excel no.
+  function soloConCbu_(sel){
+    const con = sel.filter(r=>{ const m=findAgendaMatch(r.proveedor, r.cuit); return m && m.cbu; });
+    const fuera = sel.filter(r=>!con.includes(r));
+    if(fuera.length) alert('Estas facturas NO se incluyeron en el archivo de banco porque el proveedor no tiene CBU/CVU/alias en la Agenda:\n\n• '+fuera.map(r=>(r.proveedor||'—')+' ('+fmtMoney(r.importe)+')').join('\n• ')+'\n\nSi se pagan en efectivo o con tarjeta, usá el botón de Caja o Tarjeta.');
+    return con;
+  }
   function getTransfSeleccionadas(){
     const pendientes = getFacturasPendientesDePago();
     const seleccionadas = [];
     $$('.transf-check:checked').forEach(chk=>{
-      const rec = pendientes.find(r=>r._key===chk.dataset.transfid);
-      if(rec) seleccionadas.push(rec);
+      const [fund, rowNum] = chk.dataset.transfid.split(':');
+      const rec = pendientes.find(r=>r.fundacion===fund && String(r._rowNum)===rowNum);
+      if(!rec) return;
+      // Copia con el importe "A pagar" (por defecto el saldo): todos los archivos de banco usan r.importe
+      const inp = document.querySelector('.transf-apagar[data-transfid="'+chk.dataset.transfid+'"]');
+      const saldo = Number(rec.saldo!=null ? rec.saldo : rec.importe) || 0;
+      let monto = inp ? (Number(inp.value)||0) : saldo;
+      if(monto > saldo) monto = saldo;
+      if(monto > 0) seleccionadas.push(Object.assign({}, rec, { importe: monto, importeOriginal: rec.importe, saldoPrevio: saldo }));
     });
     return seleccionadas;
   }
@@ -1753,14 +1843,15 @@
     $('#confirmar-pagos-body').innerHTML = lista.map((r,i)=>`<tr>
       <td style="text-align:center"><input type="checkbox" class="confirmar-pago-check" data-idx="${i}" checked></td>
       <td>${escapeHtml(r.proveedor||'—')}</td>
-      <td class="mono">${escapeHtml(numeroDoc_(r))}</td>
-      <td class="mono">${fmtMoney(r.importe)}</td>
+      <td class="mono">${escapeHtml(r.numeroFactura||'')}</td>
+      <td class="mono">${fmtMoney(r.importe)}${(r.saldoPrevio && r.importe < r.saldoPrevio-0.01) ? ' <span style="color:var(--media);font-size:11px;">(a cuenta)</span>' : ''}</td>
     </tr>`).join('');
-    $('#confirmar-pagos-overlay').dataset.lista = JSON.stringify(lista.map(r=>({kind:r.tipo==='factura'?'factura':'otro', fundacion:r.fundacion, rowNum:r._rowNum, proveedor:r.proveedor, legacyId: r._rowNum ? '' : (r.id||''), key:r._key})));
+    $('#confirmar-pagos-overlay').dataset.lista = JSON.stringify(lista.map(r=>({fundacion:r.fundacion, rowNum:r._rowNum, proveedor:r.proveedor, importe:Number(r.importe)||0})));
     $('#confirmar-pagos-overlay').dataset.banco = banco || '';
     $('#confirmar-pagos-overlay').querySelector('.hint').textContent = banco
       ? `Se tildaron todas por defecto y se van a marcar como pagadas vía "${banco}". Destildá las que no correspondan antes de confirmar.`
       : `Se tildaron todas por defecto y se van a marcar como Pagadas. Destildá las que no correspondan antes de confirmar.`;
+    if(/U\$S/i.test(banco||'')) $('#confirmar-pagos-overlay').querySelector('.hint').textContent += ' ⚠ Es una caja en dólares: el importe registrado se descuenta del saldo en PESOS de la factura (cargá el equivalente en pesos en "A pagar").';
     $('#confirmar-pagos-overlay').classList.remove('hidden');
   }
   $('#confirmar-pagos-close').addEventListener('click', ()=>$('#confirmar-pagos-overlay').classList.add('hidden'));
@@ -1775,16 +1866,7 @@
     $('#confirmar-pagos-aceptar').disabled = true;
     let ok=0, fallidos=0;
     for(const item of marcar){
-      try{
-        if(item.legacyId){
-          await runServer('updateOtroLegacyRecord', item.legacyId, { estado:'completado', fechaResuelta: todayISO() });
-          const rl = records.find(x=>x.id===item.legacyId && !x._rowNum); if(rl){ rl.estado='completado'; rl.fechaResuelta=todayISO(); }
-        } else {
-          await runServer('confirmarPagoRouterConBanco', item.kind||'factura', item.fundacion, item.rowNum, banco, item.proveedor||'');
-          registrarPagadoLocal_(claveRegistro_(item.fundacion, item.kind||'factura', item.rowNum), true);
-        }
-        ok++;
-      }
+      try{ await runServer('registrarPagoLote', item.fundacion, item.rowNum, item.importe, banco); ok++; }
       catch(err){ fallidos++; }
     }
     $('#confirmar-pagos-aceptar').disabled = false;
@@ -1794,15 +1876,15 @@
   });
 
   $('#btn-transf-exportar').addEventListener('click', async ()=>{
-    const sel = getTransfSeleccionadas();
+    const sel = soloConCbu_(getTransfSeleccionadas());
     if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
     if(sel.length>50){ showToast('El banco acepta máximo 50 pagos por archivo. Desmarcá algunas.'); return; }
     const filas = sel.map(r=>{
       const match = findAgendaMatch(r.proveedor, r.cuit);
       const cbu = match? match.cbu : '';
-      const numCorto = facturaNumeroCorto(numeroDoc_(r));
-      const descripcion = ((r.tipo==='compra'?'OC ':'FC ')+numCorto).slice(0,12);
-      const mensajeFallback = ('OP - '+cbu+(r.tipo==='compra'?'- Compra - OC ':'- FCFactura - FC ')+numCorto+' - $'+Math.round(Number(r.importe)||0));
+      const numCorto = facturaNumeroCorto(r.numeroFactura);
+      const descripcion = ('FC '+numCorto).slice(0,12);
+      const mensajeFallback = ('OP - '+cbu+'- FCFactura - FC '+numCorto+' - $'+Math.round(Number(r.importe)||0));
       const mensaje = (r.nombreArchivoPdf || mensajeFallback).slice(0,200);
       return {
         'CBU/CVU/Alias/Nro cuenta': cbu,
@@ -1827,7 +1909,6 @@
   async function marcarPdfsComoOpFinalizada(seleccionadas){
     const faltantes = [];
     for(const r of seleccionadas){
-      if(r.tipo!=='factura') continue; // las compras no tienen PDF en la carpeta de Mariana
       try{
         const res = await runServer('marcarOpFinalizada', r.fundacion, r._rowNum);
         if(!res || !res.ok) faltantes.push(r.proveedor);
@@ -1863,7 +1944,7 @@
 
   $('#btn-macro-pago-proveedores').addEventListener('click', async ()=>{
     $('#menu-macro').classList.add('hidden');
-    const sel = getTransfSeleccionadas();
+    const sel = soloConCbu_(getTransfSeleccionadas());
     if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
     const sinCbu = [];
     const filas = [];
@@ -1874,12 +1955,12 @@
       if(!esNumerico){ sinCbu.push(r.proveedor); return; }
       const cuitDigits = (r.cuit||'').replace(/[^0-9]/g,'');
       const modalidad = cbuDigits.indexOf('0285')===0 ? '02' : '04'; // 02: cuenta Macro, 04: otros bancos
-      const numCorto = facturaNumeroCorto(numeroDoc_(r));
+      const numCorto = facturaNumeroCorto(r.numeroFactura);
       filas.push({
         'Modalidad de Pago': modalidad,
         'Número de documento Beneficiario': cuitDigits,
         'Denominación del Beneficiario': (r.proveedor||'').slice(0,120),
-        'Identificación del pago': ((r.tipo==='compra'?'OC ':'FC ')+numCorto).slice(0,30),
+        'Identificación del pago': ('FC '+numCorto).slice(0,30),
         'Importe': Number(r.importe)||0,
         'Cuenta de pago - Nro/CBU o Nº Cheque': cbuDigits,
         'Marca de registración de cheque': '',
@@ -1906,7 +1987,7 @@
 
   $('#btn-macro-transf-masivas').addEventListener('click', async ()=>{
     $('#menu-macro').classList.add('hidden');
-    const sel = getTransfSeleccionadas();
+    const sel = soloConCbu_(getTransfSeleccionadas());
     if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
     const sinCbu = [];
     const filas = [];
@@ -1945,15 +2026,15 @@
   });
 
   $('#btn-transf-exportar-mp').addEventListener('click', async ()=>{
-    const sel = getTransfSeleccionadas();
+    const sel = soloConCbu_(getTransfSeleccionadas());
     if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
     if(sel.length>50){ showToast('Máximo 50 pagos por archivo. Desmarcá algunas.'); return; }
     const filas = sel.map(r=>{
       const match = findAgendaMatch(r.proveedor, r.cuit);
       const cbu = match? match.cbu : '';
-      const numCorto = facturaNumeroCorto(numeroDoc_(r));
-      const descripcion = ((r.tipo==='compra'?'OC ':'FC ')+numCorto).slice(0,12);
-      const mensajeFallback = ('OP - '+cbu+(r.tipo==='compra'?'- Compra - OC ':'- FCFactura - FC ')+numCorto+' - $'+Math.round(Number(r.importe)||0));
+      const numCorto = facturaNumeroCorto(r.numeroFactura);
+      const descripcion = ('FC '+numCorto).slice(0,12);
+      const mensajeFallback = ('OP - '+cbu+'- FCFactura - FC '+numCorto+' - $'+Math.round(Number(r.importe)||0));
       const mensaje = (r.nombreArchivoPdf || mensajeFallback).slice(0,200);
       return {
         'CBU/CVU/Alias/Nro cuenta': cbu,
@@ -1977,14 +2058,12 @@
 
 
   $('#btn-transf-exportar-provincia').addEventListener('click', async ()=>{
-    const sel = getTransfSeleccionadas();
+    const sel = soloConCbu_(getTransfSeleccionadas());
     if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
     // Provincia exige UN convenio (una empresa/CUIT) por archivo, así que
     // se separa automáticamente por fundación si hay una mezcla de MDG y RVP.
     const porFundacion = {};
-    const sinFund = sel.filter(r=>!r.fundacion);
-    if(sinFund.length) showToast('⚠️ '+sinFund.length+' compra(s) vieja(s) sin fundación asignada quedaron afuera del archivo Provincia. Asignales MDG o RVP con Ver / Editar.');
-    sel.filter(r=>r.fundacion).forEach(r=>{ (porFundacion[r.fundacion] = porFundacion[r.fundacion]||[]).push(r); });
+    sel.forEach(r=>{ (porFundacion[r.fundacion] = porFundacion[r.fundacion]||[]).push(r); });
 
     let huboExito = false;
     const incluidasTotal = [];
@@ -1997,7 +2076,7 @@
           importe: Number(r.importe)||0,
           cuit: r.cuit||'',
           nombre: r.proveedor||'',
-          referencia: ((r.tipo==='compra'?'OC ':'FC ')+facturaNumeroCorto(numeroDoc_(r))).slice(0,15),
+          referencia: ('FC '+facturaNumeroCorto(r.numeroFactura)).slice(0,15),
           _rec: r
         };
       });

@@ -1,4 +1,3 @@
-
 (function(){
   "use strict";
   let records = [], notas = [], logEntries = [], miEmail = '';
@@ -37,7 +36,7 @@
     return Promise.race([llamada, timeout]);
   }
 
-  const CLIENT_VERSION = 'v2026-11-06-completo'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-11-06-completo-c'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -577,6 +576,15 @@
 
   /* ---------------- EDIT MODAL ---------------- */
   let editingId=null, editingKind='otro', editingFundacion=null, editOriginalPrio='media';
+  // Refleja AL INSTANTE en pantalla el pago que el servidor acaba de registrar (la relectura completa tarda ~25 s).
+  function aplicarPagoLocal_(fundacion, rowNum, importe, res){
+    const rec = records.find(r=>r.tipo==='factura' && r.fundacion===fundacion && Number(r._rowNum)===Number(rowNum));
+    if(!rec || !res) return;
+    rec.cancelado = (Number(rec.cancelado)||0) + (Number(importe)||0);
+    rec.saldo = Number(res.saldo)||0;
+    if(res.completado){ rec.pagado = true; rec.estado = 'completado'; rec.fechaResuelta = todayISO(); }
+    else if(rec.estado!=='completado'){ rec.estado = 'en_proceso'; }
+  }
   function importePend_(r){ return (r.tipo==='factura' && r.saldo!=null) ? (Number(r.saldo)||0) : (Number(r.importe)||0); }
   function ctrlImporteEstado_(r){ const v=String((r&&r.controlImporte)||''); return v.indexOf('PENDIENTE')===0 ? 'pendiente' : (v.indexOf('AUTORIZADO')===0 ? 'autorizado' : ''); }
   function fmtFechaAR_(iso){ const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(iso||''); return m ? (m[3]+'/'+m[2]+'/'+m[1]) : (iso||''); }
@@ -669,9 +677,11 @@
     if(!(datos.importe>0)){ showToast('Ingresá un importe mayor a cero.'); return; }
     const btn = $('#e-pg-registrar'); btn.disabled = true;
     try{
-      const res = await runServer('registrarPagoParcial', editingFundacion, editingId, datos);
+      const fundSel = editingFundacion, filaSel = editingId;
+      const res = await runServer('registrarPagoParcial', fundSel, filaSel, datos);
       showToast(res.completado ? 'Registrado. Saldo $0: la factura quedó pagada por completo.' : 'Registrado. Saldo pendiente: '+fmtMoney(res.saldo));
-      closeModal(); refreshAll();
+      aplicarPagoLocal_(fundSel, filaSel, datos.importe, res);
+      closeModal(); renderAll(); refreshAll();
     }catch(err){ showToast(err.message||'No se pudo registrar.'); }
     btn.disabled = false;
   });
@@ -679,7 +689,14 @@
     if(!editingId || editingKind!=='factura') return;
     const nota = prompt('Vas a autorizar el pago de esta factura con importe fuera de lo habitual.\n\nNota opcional (ej: "confirmado con Dirección por mail"):');
     if(nota===null) return;
-    try{ await runServer('autorizarImporte', editingFundacion, editingId, nota); showToast('Importe autorizado.'); closeModal(); refreshAll(); }
+    try{
+      const fundSel = editingFundacion, filaSel = editingId;
+      await runServer('autorizarImporte', fundSel, filaSel, nota);
+      showToast('Importe autorizado.');
+      const rec = records.find(r=>r.tipo==='factura' && r.fundacion===fundSel && Number(r._rowNum)===Number(filaSel));
+      if(rec) rec.controlImporte = String(rec.controlImporte||'').replace(/^PENDIENTE/, 'AUTORIZADO');
+      closeModal(); renderAll(); refreshAll();
+    }
     catch(err){ showToast(err.message||'No se pudo autorizar.'); }
   });
   $('#modal-close').addEventListener('click', closeModal);
@@ -1865,13 +1882,19 @@
     });
     $('#confirmar-pagos-aceptar').disabled = true;
     let ok=0, fallidos=0;
+    const motivos = [];
     for(const item of marcar){
-      try{ await runServer('registrarPagoLote', item.fundacion, item.rowNum, item.importe, banco); ok++; }
-      catch(err){ fallidos++; }
+      try{
+        const res = await runServer('registrarPagoLote', item.fundacion, item.rowNum, item.importe, banco);
+        ok++;
+        aplicarPagoLocal_(item.fundacion, item.rowNum, item.importe, res);
+      }catch(err){ fallidos++; motivos.push((item.proveedor||'—')+': '+(err && err.message ? err.message : 'error')); }
     }
     $('#confirmar-pagos-aceptar').disabled = false;
     $('#confirmar-pagos-overlay').classList.add('hidden');
-    showToast('Marcadas como pagadas: '+ok+(fallidos? ' · '+fallidos+' con error':'')+'.');
+    showToast('Pagos registrados: '+ok+(fallidos? ' · '+fallidos+' con error':'')+'.');
+    renderAll();
+    if(motivos.length) alert('No se pudieron registrar estos pagos:\n\n• '+motivos.join('\n• '));
     refreshAll();
   });
 

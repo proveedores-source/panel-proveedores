@@ -150,7 +150,7 @@
     // Las "eliminadas" ya no se filtran acá globalmente — cada vista decide
     // si las excluye (Tablero/Dashboard/Transferencias siempre las excluyen)
     // o si las muestra (Listado tiene un selector Activas/Eliminadas/Todas).
-    records.forEach(r=>{ r._key = r.fundacion ? (r.fundacion+':'+r._rowNum) : r.id; });
+    records.forEach(r=>{ r._key = r.fundacion ? ((r.tipo==='factura' ? 'f:' : 'o:')+r.fundacion+':'+r._rowNum) : r.id; });
     if(!mdgR.ok) fallidas.push('facturas MDG ('+(mdgR.error&&mdgR.error.message||'error')+')');
     if(!rvpR.ok) fallidas.push('facturas RVP ('+(rvpR.error&&rvpR.error.message||'error')+')');
     if(!otrosR.ok) fallidas.push('otros registros ('+(otrosR.error&&otrosR.error.message||'error')+')');

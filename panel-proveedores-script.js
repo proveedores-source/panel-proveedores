@@ -26,16 +26,16 @@
   function showToast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.remove('hidden'); clearTimeout(showToast._h); showToast._h=setTimeout(()=>t.classList.add('hidden'),3200); }
 
   /* ---------------- SERVER BRIDGE ---------------- */
-  function runServer(fn, ...args){
+   function runServer(fn, ...args){
     const llamada = new Promise((resolve, reject)=>{
       google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn](...args);
     });
-        const limiteMs = (fn==='processTransferenciasFolder' || fn==='processComprasPresupuestoFolder') ? 330000 : 25000;
+    const limiteMs = (fn==='processTransferenciasFolder' || fn==='processComprasPresupuestoFolder') ? 330000 : 25000;
     const timeout = new Promise((_, reject)=>{
       setTimeout(()=>reject(new Error('Se agotó el tiempo de espera ('+(limiteMs/1000)+'s) para '+fn+'.')), limiteMs);
     });
+    return Promise.race([llamada, timeout]);
   }
-
   const CLIENT_VERSION = 'v2026-11-06-completo-c'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }

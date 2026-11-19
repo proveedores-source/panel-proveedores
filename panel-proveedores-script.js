@@ -30,10 +30,10 @@
     const llamada = new Promise((resolve, reject)=>{
       google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn](...args);
     });
+        const limiteMs = (fn==='processTransferenciasFolder' || fn==='processComprasPresupuestoFolder') ? 330000 : 25000;
     const timeout = new Promise((_, reject)=>{
-      setTimeout(()=>reject(new Error('Se agotó el tiempo de espera (25s) para '+fn+'.')), 25000);
+      setTimeout(()=>reject(new Error('Se agotó el tiempo de espera ('+(limiteMs/1000)+'s) para '+fn+'.')), limiteMs);
     });
-    return Promise.race([llamada, timeout]);
   }
 
   const CLIENT_VERSION = 'v2026-11-06-completo-c'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
@@ -1233,6 +1233,7 @@
       const respuesta = await runServer('processTransferenciasFolder');
       statusEl.textContent = '';
       mostrarResumenComprobantes(respuesta.resultados||[], respuesta.sinBanco||[]);
+      if(respuesta.quedanPendientes) statusEl.textContent = 'Quedan '+respuesta.quedanPendientes+' comprobante(s) sin leer por falta de tiempo: tocá el botón de nuevo.';
       if((respuesta.resultados||[]).some(r=>r.resultado==='ok')) refreshAll();
     }catch(err){
       statusEl.textContent = 'Error: '+(err.message||'no se pudo revisar.');
@@ -1252,6 +1253,7 @@
       const sinId = resultados.filter(r=>r.resultado==='sinIdentificar').length;
       const err = resultados.filter(r=>r.resultado==='error').length;
       statusEl.textContent = resultados.length ? `Cargados: ${ok} · Sin identificar: ${sinId} · Con error: ${err}.` : 'No había archivos nuevos.';
+            if(respuesta.quedanPendientes) statusEl.textContent += ' Quedan '+respuesta.quedanPendientes+' sin leer por falta de tiempo: tocá el botón de nuevo.';
       if(ok>0) refreshAll();
     }catch(err){
       statusEl.textContent = 'Error: '+(err.message||'no se pudo revisar.');

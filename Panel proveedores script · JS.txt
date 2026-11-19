@@ -334,7 +334,13 @@
     $('#btn-extract-comprobante').disabled = true;
     try{
       const base64 = await fileToBase64(file);
-      const extracted = await runServer('extractComprobantePagoSrv', base64, file.type||'image/jpeg', medio);
+      const extracted = await runServer('No se pudo guardar', base64, file.type||'image/jpeg', medio);
+      if(extracted.duplicado){
+        const d = extracted.duplicado;
+        alert('⚠ COMPROBANTE DUPLICADO\n\nEste comprobante (N° '+(extracted.numeroComprobante||'')+') ya está cargado en "'+d.hoja+'" (fila '+d.fila+'):\n• '+(d.proveedor||'—')+' · '+fmtMoney(d.importe)+(d.fecha?' · '+d.fecha:'')+'\n\nNo se vuelve a cargar.');
+        statusEl.textContent = 'Duplicado: ya estaba cargado.';
+        return;
+      }
       let proveedorFinal = extracted.beneficiario || '', cuitFinal = extracted.cuitDestino || '', clasifFinal = '';
       if(extracted.beneficiario || extracted.cuitDestino){
         try{
@@ -489,7 +495,7 @@
           }
         }
       }
-    }catch(err){ showToast('No se pudo guardar: '+(err.message||'error')); }
+        }catch(err){ if(/DUPLICADO/.test(err.message||'')) alert(err.message); else showToast('No se pudo guardar: '+(err.message||'error')); }
   });
 
   /* ---------------- TABS ---------------- */
@@ -739,7 +745,7 @@
     try{
       await runServer('updateRecordRouter', editingKind, editingFundacion, editingId, patch, `Editó registro de "${proveedorNuevo}"`);
       showToast('Cambios guardados.'); closeModal(); refreshAll();
-    }catch(err){ showToast('No se pudo guardar: '+(err.message||'error')); }
+        }catch(err){ if(/DUPLICADO/.test(err.message||'')) alert(err.message); else showToast('No se pudo guardar: '+(err.message||'error')); }
   });
   $('#btn-delete').addEventListener('click', async ()=>{
     if(!editingId && editingId!==0) return;

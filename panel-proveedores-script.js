@@ -26,17 +26,19 @@
   function showToast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.remove('hidden'); clearTimeout(showToast._h); showToast._h=setTimeout(()=>t.classList.add('hidden'),3200); }
 
   /* ---------------- SERVER BRIDGE ---------------- */
-   function runServer(fn, ...args){
+  function runServer(fn, ...args){
     const llamada = new Promise((resolve, reject)=>{
       google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn](...args);
     });
+    // Leer comprobantes con la IA tarda bastante más que una consulta común
     const limiteMs = (fn==='processTransferenciasFolder' || fn==='processComprasPresupuestoFolder') ? 330000 : 25000;
     const timeout = new Promise((_, reject)=>{
       setTimeout(()=>reject(new Error('Se agotó el tiempo de espera ('+(limiteMs/1000)+'s) para '+fn+'.')), limiteMs);
     });
     return Promise.race([llamada, timeout]);
   }
-  const CLIENT_VERSION = 'v2026-11-06-completo-c'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+
+  const CLIENT_VERSION = 'v2026-11-06-completo-d'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -150,7 +152,7 @@
     // Las "eliminadas" ya no se filtran acá globalmente — cada vista decide
     // si las excluye (Tablero/Dashboard/Transferencias siempre las excluyen)
     // o si las muestra (Listado tiene un selector Activas/Eliminadas/Todas).
-    records.forEach(r=>{ r._key = r.fundacion ? ((r.tipo==='factura' ? 'f:' : 'o:')+r.fundacion+':'+r._rowNum) : r.id; });
+    records.forEach(r=>{ r._key = r.fundacion ? ((r.tipo==='factura' ? 'f:' : 'o:')+r.fundacion+':'+r._rowNum) : r.id; });  // 'f'/'o': una compra de Otros MDG y una factura de MDG pueden tener la misma fila
     if(!mdgR.ok) fallidas.push('facturas MDG ('+(mdgR.error&&mdgR.error.message||'error')+')');
     if(!rvpR.ok) fallidas.push('facturas RVP ('+(rvpR.error&&rvpR.error.message||'error')+')');
     if(!otrosR.ok) fallidas.push('otros registros ('+(otrosR.error&&otrosR.error.message||'error')+')');
@@ -335,6 +337,12 @@
     try{
       const base64 = await fileToBase64(file);
       const extracted = await runServer('extractComprobantePagoSrv', base64, file.type||'image/jpeg', medio);
+      if(extracted.duplicado){
+        const d = extracted.duplicado;
+        alert('⚠ COMPROBANTE DUPLICADO\n\nEste comprobante (N° '+(extracted.numeroComprobante||'')+') ya está cargado en "'+d.hoja+'" (fila '+d.fila+'):\n• '+(d.proveedor||'—')+' · '+fmtMoney(d.importe)+(d.fecha?' · '+d.fecha:'')+'\n\nNo se vuelve a cargar.');
+        statusEl.textContent = 'Duplicado: ya estaba cargado.';
+        return;
+      }
       let proveedorFinal = extracted.beneficiario || '', cuitFinal = extracted.cuitDestino || '', clasifFinal = '';
       if(extracted.beneficiario || extracted.cuitDestino){
         try{
@@ -489,7 +497,7 @@
           }
         }
       }
-    }catch(err){ showToast('No se pudo guardar: '+(err.message||'error')); }
+    }catch(err){ if(/DUPLICADO/.test(err.message||'')) alert(err.message); else showToast('No se pudo guardar: '+(err.message||'error')); }
   });
 
   /* ---------------- TABS ---------------- */
@@ -739,7 +747,7 @@
     try{
       await runServer('updateRecordRouter', editingKind, editingFundacion, editingId, patch, `Editó registro de "${proveedorNuevo}"`);
       showToast('Cambios guardados.'); closeModal(); refreshAll();
-    }catch(err){ showToast('No se pudo guardar: '+(err.message||'error')); }
+    }catch(err){ if(/DUPLICADO/.test(err.message||'')) alert(err.message); else showToast('No se pudo guardar: '+(err.message||'error')); }
   });
   $('#btn-delete').addEventListener('click', async ()=>{
     if(!editingId && editingId!==0) return;
@@ -1227,7 +1235,7 @@
 
   $('#btn-revisar-comprobantes').addEventListener('click', async ()=>{
     const statusEl = $('#comprobantes-status');
-    statusEl.innerHTML = '<span class="spinner"></span>Leyendo comprobantes...';
+    statusEl.innerHTML = '<span class="spinner"></span>Leyendo comprobantes… puede tardar unos minutos (cada uno lo lee la IA). No cierres la pestaña.';
     $('#btn-revisar-comprobantes').disabled = true;
     try{
       const respuesta = await runServer('processTransferenciasFolder');
@@ -1253,7 +1261,7 @@
       const sinId = resultados.filter(r=>r.resultado==='sinIdentificar').length;
       const err = resultados.filter(r=>r.resultado==='error').length;
       statusEl.textContent = resultados.length ? `Cargados: ${ok} · Sin identificar: ${sinId} · Con error: ${err}.` : 'No había archivos nuevos.';
-            if(respuesta.quedanPendientes) statusEl.textContent += ' Quedan '+respuesta.quedanPendientes+' sin leer por falta de tiempo: tocá el botón de nuevo.';
+      if(respuesta.quedanPendientes) statusEl.textContent += ' Quedan '+respuesta.quedanPendientes+' sin leer por falta de tiempo: tocá el botón de nuevo.';
       if(ok>0) refreshAll();
     }catch(err){
       statusEl.textContent = 'Error: '+(err.message||'no se pudo revisar.');

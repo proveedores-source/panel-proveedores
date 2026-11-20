@@ -19,26 +19,81 @@
     return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="3.2"/><path d="M4.5 20a7.5 7.5 0 0 1 15 0"/></svg>';
   }
   function todayISO(){ return new Date().toISOString().slice(0,10); }
-  function fmtDateShort(iso){ if(!iso) return '—'; const d=new Date(iso+'T00:00:00'); return d.toLocaleDateString('es-AR',{day:'2-digit',month:'2-digit',year:'2-digit'}); }
+  function fmtDateShort(iso){ if(!iso) return '—'; const m=/^(\d{4})-(\d{2})-(\d{2})/.exec(String(iso)); return m ? (m[3]+'/'+m[2]+'/'+m[1].slice(2)) : String(iso); }
   function fmtMoney(n){ n=Number(n)||0; return n.toLocaleString('es-AR',{style:'currency',currency:'ARS',maximumFractionDigits:0}); }
   function daysBetween(a,b){ const da=new Date(a+'T00:00:00'), db=new Date(b+'T00:00:00'); return Math.round((db-da)/86400000); }
   function escapeHtml(s){ return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
   function showToast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.remove('hidden'); clearTimeout(showToast._h); showToast._h=setTimeout(()=>t.classList.add('hidden'),3200); }
 
+  /* ---------- Utilidades de seguridad / idempotencia (Lote 5) ---------- */
+  // Identificador único por operación: si la misma operación se reintenta (corte de red, doble clic)
+  // el servidor reconoce el identificador y no la repite.
+  function nuevoRequestId_(){
+    try{
+      if(window.crypto && crypto.randomUUID) return crypto.randomUUID();
+      const a = new Uint32Array(4); crypto.getRandomValues(a);
+      return Array.from(a).map(n=>n.toString(16)).join('-');
+    }catch(e){ return 'r'+Date.now().toString(36)+Math.random().toString(36).slice(2,10); }
+  }
+  // Mismo dato = mismo identificador (reintento); datos distintos = identificador nuevo.
+  const requestIdsPorClave_ = {};
+  function requestIdParaDatos_(clave, datos){
+    const firma = JSON.stringify(datos, (k,v)=> (typeof v==='string' && v.length>200) ? (v.length+':'+v.slice(0,40)+':'+v.slice(-40)) : v);
+    const previo = requestIdsPorClave_[clave];
+    if(previo && previo.firma===firma) return previo.id;
+    const id = nuevoRequestId_();
+    requestIdsPorClave_[clave] = { firma, id };
+    return id;
+  }
+  // Valores que van a una celda de Excel: se saca el signo inicial que Excel interpretaría como fórmula.
+  function textoXlsx_(s){ return String(s==null?'':s).replace(/^[=+\-@\t\r\n]+/, ''); }
+  function fechaHoyAR_(){
+    const d = new Date();
+    return String(d.getDate()).padStart(2,'0')+'/'+String(d.getMonth()+1).padStart(2,'0')+'/'+d.getFullYear();
+  }
+  // Los datos vienen de una planilla que cualquiera puede editar: lo que se usa como "tipo", "estado", etc.
+  // se limita a los valores conocidos antes de armar pantallas con ellos.
+  function sanearRegistro_(r){
+    if(!r || typeof r!=='object') return r;
+    r.tipo = Object.prototype.hasOwnProperty.call(TIPO_LABEL, r.tipo) ? r.tipo : 'consulta';
+    r.estado = Object.prototype.hasOwnProperty.call(ESTADO_LABEL, r.estado) ? r.estado : 'pendiente';
+    r.prioridad = Object.prototype.hasOwnProperty.call(PRIO_ORDER, r.prioridad) ? r.prioridad : 'media';
+    if(r.fuente && !Object.prototype.hasOwnProperty.call(FUENTE_LABEL, r.fuente)) r.fuente = '';
+    if(r.canal && !Object.prototype.hasOwnProperty.call(FUENTE_LABEL, r.canal)) r.canal = '';
+    r.fundacion = (r.fundacion==='mdg' || r.fundacion==='rvp') ? r.fundacion : (r.fundacion ? '' : r.fundacion);
+    if(r._rowNum!=null) r._rowNum = Number(r._rowNum) || 0;
+    return r;
+  }
+  function claveSegura_(s){ return String(s==null?'':s).replace(/[^A-Za-z0-9_:.\-]/g,'_'); }
+
   /* ---------------- SERVER BRIDGE ---------------- */
+  // Tiempo máximo de espera por función (ms). Las que escriben en la planilla pueden esperar el turno del
+  // servidor hasta 30 s, por eso tienen más margen que una consulta.
+  const LIMITES_MS_ = {
+    processTransferenciasFolder: 330000, processComprasPresupuestoFolder: 330000,
+    prepararExportacion: 90000, confirmarExportacion: 150000, cancelarExportacion: 60000,
+    generarArchivoProvinciaDeExportacion: 60000,
+    addRecord: 90000, registrarPagoParcial: 60000, registrarPagoLote: 60000,
+    importArcaComprobantes: 150000, importAgendaBulk: 120000
+  };
+  // Funciones que cambian datos: si se agota la espera, el cambio puede haberse hecho igual.
+  const FUNCIONES_QUE_ESCRIBEN_ = /^(add|save|update|delete|remove|import|registrar|confirmar|cancelar|preparar|marcar|generar|autorizar|toggle|set|crear|guardar|editar|eliminar)/i;
   function runServer(fn, ...args){
     const llamada = new Promise((resolve, reject)=>{
       google.script.run.withSuccessHandler(resolve).withFailureHandler(reject)[fn](...args);
     });
-    // Leer comprobantes con la IA tarda bastante más que una consulta común
-    const limiteMs = (fn==='processTransferenciasFolder' || fn==='processComprasPresupuestoFolder') ? 330000 : 25000;
+    const limiteMs = LIMITES_MS_[fn] || 25000;
+    let timer;
     const timeout = new Promise((_, reject)=>{
-      setTimeout(()=>reject(new Error('Se agotó el tiempo de espera ('+(limiteMs/1000)+'s) para '+fn+'.')), limiteMs);
+      timer = setTimeout(()=>{
+        const aviso = FUNCIONES_QUE_ESCRIBEN_.test(fn) ? ' Es posible que el cambio SÍ se haya guardado: actualizá el panel (F5) y verificá antes de repetirlo.' : '';
+        reject(new Error('Se agotó el tiempo de espera ('+(limiteMs/1000)+'s) para '+fn+'.'+aviso));
+      }, limiteMs);
     });
-    return Promise.race([llamada, timeout]);
+    return Promise.race([llamada, timeout]).finally(()=>clearTimeout(timer));
   }
 
-  const CLIENT_VERSION = 'v2026-11-06-completo-d'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-11-19-lote5-a'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -111,7 +166,17 @@
   }
   async function cargarLogSiHaceFalta(){ if(!logCargado) await cargarLog_(); }
 
-  async function refreshAll(){
+  // Una sola recarga a la vez: si piden otra mientras corre, se repite al terminar (evita lecturas superpuestas).
+  let refreshEnCurso_ = null, refreshRepetir_ = false;
+  function refreshAll(){
+    if(refreshEnCurso_){ refreshRepetir_ = true; return refreshEnCurso_; }
+    refreshEnCurso_ = (async ()=>{
+      try{ do{ refreshRepetir_ = false; await refreshAll_(); }while(refreshRepetir_); }
+      finally{ refreshEnCurso_ = null; }
+    })();
+    return refreshEnCurso_;
+  }
+  async function refreshAll_(){
     cargaInicialCompleta = false;
     const fallidas = [];
     const tiempos = [];
@@ -152,7 +217,8 @@
     // Las "eliminadas" ya no se filtran acá globalmente — cada vista decide
     // si las excluye (Tablero/Dashboard/Transferencias siempre las excluyen)
     // o si las muestra (Listado tiene un selector Activas/Eliminadas/Todas).
-    records.forEach(r=>{ r._key = r.fundacion ? ((r.tipo==='factura' ? 'f:' : 'o:')+r.fundacion+':'+r._rowNum) : r.id; });  // 'f'/'o': una compra de Otros MDG y una factura de MDG pueden tener la misma fila
+    records.forEach(sanearRegistro_);
+    records.forEach(r=>{ r._key = r.fundacion ? ((r.tipo==='factura' ? 'f:' : 'o:')+r.fundacion+':'+r._rowNum) : claveSegura_(r.id); });  // 'f'/'o': una compra de Otros MDG y una factura de MDG pueden tener la misma fila
     if(!mdgR.ok) fallidas.push('facturas MDG ('+(mdgR.error&&mdgR.error.message||'error')+')');
     if(!rvpR.ok) fallidas.push('facturas RVP ('+(rvpR.error&&rvpR.error.message||'error')+')');
     if(!otrosR.ok) fallidas.push('otros registros ('+(otrosR.error&&otrosR.error.message||'error')+')');
@@ -187,6 +253,7 @@
     renderAll();
     if(soyAdmin) refreshUsuarios();
     cargaInicialCompleta = true;
+    cargarExportacionesPendientes_();
 
     if(fallidas.length){
       console.error('Fallaron al cargar:', fallidas);
@@ -478,6 +545,7 @@
       };
     }
     try{
+      rec.requestId = requestIdParaDatos_('addRecord', rec);
       const resAdd = await runServer('addRecord', rec);
       showToast('Registro guardado.');
       if(resAdd && resAdd.alertaImporte){
@@ -508,6 +576,7 @@
       $('#view-'+btn.dataset.view).classList.add('active');
       if(btn.dataset.view==='arca') cargarArcaSiHaceFalta();
       if(btn.dataset.view==='actividad') cargarLogSiHaceFalta();
+      if(btn.dataset.view==='transferencias') cargarExportacionesPendientes_();
     });
   });
 
@@ -686,7 +755,7 @@
     const btn = $('#e-pg-registrar'); btn.disabled = true;
     try{
       const fundSel = editingFundacion, filaSel = editingId;
-      const res = await runServer('registrarPagoParcial', fundSel, filaSel, datos);
+      const res = await runServer('registrarPagoParcial', fundSel, filaSel, datos, requestIdParaDatos_('pp:'+fundSel+':'+filaSel, datos));
       showToast(res.completado ? 'Registrado. Saldo $0: la factura quedó pagada por completo.' : 'Registrado. Saldo pendiente: '+fmtMoney(res.saldo));
       aplicarPagoLocal_(fundSel, filaSel, datos.importe, res);
       closeModal(); renderAll(); refreshAll();
@@ -1660,18 +1729,40 @@
    * Tipo de transferencia;Acceso;Mail 1..5;Agregado por
    * A veces el nombre real está en "Descripción de Contacto" y "Nombre/Razón
    * social" repite el número de cuenta — y hay filas duplicadas por contacto. */
+  // CSV con campos entre comillas (pueden contener ; o saltos de línea).
+  function parseCsvTexto_(text, sep){
+    const filas = []; let fila = [], campo = '', enComillas = false;
+    for(let i=0;i<text.length;i++){
+      const ch = text[i];
+      if(enComillas){
+        if(ch==='"'){ if(text[i+1]==='"'){ campo+='"'; i++; } else enComillas = false; }
+        else campo += ch;
+      } else if(ch==='"' && campo===''){ enComillas = true; }
+      else if(ch===sep){ fila.push(campo); campo=''; }
+      else if(ch==='\n'){ fila.push(campo); filas.push(fila); fila=[]; campo=''; }
+      else if(ch!=='\r'){ campo += ch; }
+    }
+    if(campo!=='' || fila.length){ fila.push(campo); filas.push(fila); }
+    return filas.filter(f=>f.some(c=>String(c).trim()));
+  }
+  // Excel guarda los números largos como número (pierde dígitos) o en notación científica: no sirven como CBU.
+  function cbuLegible_(v){
+    if(typeof v==='number') return Number.isSafeInteger(v) ? { valor:String(v), ilegible:false } : { valor:'', ilegible:true };
+    const t = String(v==null?'':v).trim();
+    return /^\d+([.,]\d+)?e[+-]?\d+$/i.test(t) ? { valor:'', ilegible:true } : { valor:t, ilegible:false };
+  }
   function parseBankContactsCsv(text){
     text = text.replace(/^\uFEFF/, ''); // sacar BOM
-    const lines = text.split(/\r?\n/).filter(l=>l.trim().length);
-    if(!lines.length) return [];
-    const headers = lines[0].split(';').map(h=>h.trim());
+    const tabla = parseCsvTexto_(text, ';');
+    if(!tabla.length) return [];
+    const headers = tabla[0].map(h=>String(h).trim());
     const idx = name => headers.indexOf(name);
     const iCuenta = idx('Cuenta destino'), iCuit = idx('CUIT/CUIL'), iNombre = idx('Nombre/Razón social'),
           iDesc = idx('Descripción de Contacto'), iMail1 = idx('Mail 1'), iMail2 = idx('Mail 2'),
           iMail3 = idx('Mail 3'), iMail4 = idx('Mail 4'), iMail5 = idx('Mail 5');
     const rows = [];
-    for(let i=1;i<lines.length;i++){
-      const cols = lines[i].split(';');
+    for(let i=1;i<tabla.length;i++){
+      const cols = tabla[i];
       const cuenta = (cols[iCuenta]||'').trim();
       const cuitDigits = (cols[iCuit]||'').trim();
       const nombre = (cols[iNombre]||'').trim();
@@ -1703,6 +1794,7 @@
     statusEl.innerHTML = '<span class="spinner"></span>Leyendo archivo...';
     try{
       let rows;
+      const cbuIlegibles = [];
       if(file.name.toLowerCase().endsWith('.csv')){
         const text = await file.text();
         rows = parseBankContactsCsv(text);
@@ -1721,6 +1813,10 @@
         })).filter(r=>r.proveedor);
       }
       if(!rows.length){ statusEl.textContent='No se encontraron filas para importar.'; return; }
+      rows.forEach(r=>{ const c = cbuLegible_(r.cbu); if(c.ilegible) cbuIlegibles.push(r.proveedor||'—'); r.cbu = c.valor; });
+      if(cbuIlegibles.length){
+        if(!confirm('Estos contactos tienen el CBU guardado como número (Excel lo recortó o lo pasó a notación científica) y NO se pueden leer:\n\n• '+cbuIlegibles.slice(0,15).join('\n• ')+(cbuIlegibles.length>15?'\n• ...':'')+'\n\nPara arreglarlo, formateá esa columna como TEXTO antes de pegar los CBU.\n\n¿Importar igual los contactos (con el CBU vacío en esos)?')){ statusEl.textContent='Importación cancelada.'; return; }
+      }
       statusEl.innerHTML = `<span class="spinner"></span>Importando ${rows.length} contacto(s)...`;
       const res = await runServer('importAgendaBulk', rows);
       statusEl.textContent = `✅ Listo: ${res.creados} nuevos, ${res.actualizados} actualizados.`;
@@ -1787,33 +1883,6 @@
       (!transfFechaHasta || (r.fechaRecibida && r.fechaRecibida<=transfFechaHasta))
     );
   }
-  $('#btn-transf-exportar-excel').addEventListener('click', ()=>{
-    const filas = getTransfSeleccionadas();
-    if(!filas.length){ showToast('Tildá al menos una factura para exportar.'); return; }
-    const headers = ['Fundación','Proveedor','CUIT','N° Factura','Importe','Fecha Recibida','CBU/CVU/Alias','Email','En Agenda'];
-    const datos = filas.map(r=>{
-      const match = findAgendaMatch(r.proveedor, r.cuit);
-      return {
-        'Fundación': r.fundacion.toUpperCase(),
-        'Proveedor': r.proveedor || '',
-        'CUIT': r.cuit || '',
-        'N° Factura': r.numeroFactura || '',
-        'Importe': Number(r.importe)||0,
-        'Fecha Recibida': r.fechaRecibida || '',
-        'CBU/CVU/Alias': match ? (match.cbu||'') : '',
-        'Email': match ? (match.email||'') : '',
-        'En Agenda': (match && match.cbu) ? 'Sí' : 'Falta CBU'
-      };
-    });
-    const ws = XLSX.utils.json_to_sheet(datos, {header: headers});
-    ws['!autofilter'] = { ref: ws['!ref'] };
-    ws['!cols'] = headers.map(h => ({ wch: Math.max(12, h.length+2) }));
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Pagos');
-    XLSX.writeFile(wb, 'Pagos_'+todayISO()+'.xlsx');
-    showToast('Exportado: '+datos.length+' fila(s).');
-    abrirConfirmacionPagos(filas, '');
-  });
   function renderTransferencias(){
     const pendientes = getTransfFiltradas();
     $('#transf-empty').style.display = pendientes.length? 'none':'block';
@@ -1840,13 +1909,6 @@
   ['transf-filt-fundacion','transf-buscar'].forEach(id=>$('#'+id).addEventListener('input', renderTransferencias));
   $('#transf-filt-fundacion').addEventListener('change', renderTransferencias);
 
-  // Los archivos de banco necesitan CBU/CVU/alias en la Agenda; Caja/Tarjeta/Excel no.
-  function soloConCbu_(sel){
-    const con = sel.filter(r=>{ const m=findAgendaMatch(r.proveedor, r.cuit); return m && m.cbu; });
-    const fuera = sel.filter(r=>!con.includes(r));
-    if(fuera.length) alert('Estas facturas NO se incluyeron en el archivo de banco porque el proveedor no tiene CBU/CVU/alias en la Agenda:\n\n• '+fuera.map(r=>(r.proveedor||'—')+' ('+fmtMoney(r.importe)+')').join('\n• ')+'\n\nSi se pagan en efectivo o con tarjeta, usá el botón de Caja o Tarjeta.');
-    return con;
-  }
   function getTransfSeleccionadas(){
     const pendientes = getFacturasPendientesDePago();
     const seleccionadas = [];
@@ -1871,90 +1933,277 @@
     $('#transf-resumen-warn').style.display = sel.length>50 ? 'inline' : 'none';
   }
 
-  function abrirConfirmacionPagos(lista, banco){
-    if(!lista.length) return;
+  /* ---------------- EXPORTACIONES A BANCOS ---------------- */
+  // Flujo: 1) el servidor valida las facturas y deja la exportación PENDIENTE; 2) se descarga el archivo
+  // con lo que el servidor aprobó; 3) se confirma qué pagos se subieron al banco. Mientras no se confirma,
+  // la exportación queda a la vista de todos en el aviso de Transferencias (también si se cierra el diálogo).
+  let exportacionesPendientes = [];
+  async function cargarExportacionesPendientes_(){
+    const r = await callSeguro('getExportacionesPendientes');
+    if(r.ok) exportacionesPendientes = Array.isArray(r.value) ? r.value : [];
+    renderExportacionesPendientes_();
+  }
+  function bannerExportaciones_(){
+    let el = $('#exp-pendientes-banner');
+    if(el) return el;
+    const vista = $('#view-transferencias');
+    if(!vista) return null;
+    el = document.createElement('div');
+    el.id = 'exp-pendientes-banner';
+    el.style.cssText = 'display:none;margin:0 0 12px;padding:10px 12px;border:1px solid var(--media);background:var(--media-soft);border-radius:8px;font-size:13px;';
+    vista.insertBefore(el, vista.firstChild);
+    el.addEventListener('click', (e)=>{
+      const b = e.target.closest('button'); if(!b) return;
+      if(b.dataset.expConfirmar) confirmarPendienteDesdeAviso_(b.dataset.expConfirmar);
+      else if(b.dataset.expCancelar) cancelarPendienteDesdeAviso_(b.dataset.expCancelar);
+      else if(b.dataset.expRedescargar) redescargarProvincia_(b.dataset.expRedescargar);
+    });
+    return el;
+  }
+  function renderExportacionesPendientes_(){
+    const n = exportacionesPendientes.length;
+    const tab = document.querySelector('.tab[data-view="transferencias"], [data-view="transferencias"]');
+    if(tab){
+      let chip = tab.querySelector('.exp-chip');
+      if(n && !chip){ chip = document.createElement('span'); chip.className = 'exp-chip'; chip.style.cssText='margin-left:6px;background:var(--media);color:#fff;border-radius:10px;padding:0 6px;font-size:11px;'; tab.appendChild(chip); }
+      if(chip){ if(n) chip.textContent = String(n); else chip.remove(); }
+    }
+    const el = bannerExportaciones_(); if(!el) return;
+    if(!n){ el.style.display = 'none'; el.innerHTML = ''; return; }
+    el.style.display = 'block';
+    el.innerHTML = '<b>⚠ Hay '+n+' exportación(es) a banco sin confirmar.</b> Descargar el archivo no registra ningún pago: los pagos se registran recién al confirmar acá. Hasta entonces esas facturas no se pueden volver a exportar.'+
+      exportacionesPendientes.map(ex=>`<div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+        <span>${escapeHtml(ex.banco)} · ${escapeHtml(ex.cantidad)} pago(s) · ${fmtMoney(ex.total)} · ${escapeHtml(ex.usuario||'')} · ${escapeHtml(fmtFechaHoraAR_(ex.creada))}</span>
+        <button class="btn" data-exp-confirmar="${escapeHtml(ex.id)}">Confirmar pagos</button>
+        ${ex.banco==='Banco Provincia' ? `<button class="btn btn-ghost" data-exp-redescargar="${escapeHtml(ex.id)}">Volver a descargar archivo</button>` : ''}
+        <button class="btn btn-ghost" data-exp-cancelar="${escapeHtml(ex.id)}">Cancelar</button>
+      </div>`).join('');
+  }
+  function confirmarPendienteDesdeAviso_(id){
+    const ex = exportacionesPendientes.find(e=>e.id===id); if(!ex) return;
+    abrirConfirmacionExportacion_(ex.id, ex.banco, ex.items);
+  }
+  async function cancelarPendienteDesdeAviso_(id){
+    const ex = exportacionesPendientes.find(e=>e.id===id); if(!ex) return;
+    if(!confirm('¿Cancelar la exportación a '+ex.banco+' ('+ex.cantidad+' pago(s), '+fmtMoney(ex.total)+')?\n\nNo se registra ningún pago y las facturas quedan libres.\nSi ya subiste el archivo al banco, tenés que anular esa operación en el banco.')) return;
+    try{ await runServer('cancelarExportacion', id); showToast('Exportación cancelada.'); }
+    catch(err){ alert('No se pudo cancelar: '+(err&&err.message||'error')); }
+    await cargarExportacionesPendientes_();
+  }
+  function descargarTexto_(contenido, nombre){
+    const blob = new Blob([contenido], {type:'text/plain;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = nombre;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  }
+  async function descargarArchivosProvincia_(exportacionId, fundaciones){
+    let total = 0, importe = 0;
+    for(const fundacion of fundaciones){
+      const res = await runServer('generarArchivoProvinciaDeExportacion', exportacionId, fundacion);
+      descargarTexto_(res.contenido, 'TRANSF_BANCO_PROVINCIA_'+res.rotulo+'_'+fundacion.toUpperCase()+'_'+todayISO()+'.txt');
+      total += Number(res.cantidadPagos)||0; importe += Number(res.importeTotal)||0;
+      await esperar_(500); // el navegador puede bloquear descargas simultáneas
+    }
+    return { cantidad: total, importe };
+  }
+  async function redescargarProvincia_(id){
+    const ex = exportacionesPendientes.find(e=>e.id===id); if(!ex) return;
+    const fundaciones = Array.from(new Set(ex.items.map(i=>i.fundacion)));
+    try{ const r = await descargarArchivosProvincia_(id, fundaciones); showToast('Archivo(s) Banco Provincia descargado(s): '+r.cantidad+' pago(s).'); }
+    catch(err){ alert('No se pudo generar el archivo: '+(err&&err.message||'error')); }
+  }
+
+  // Paso 1: el servidor decide qué facturas se pueden exportar. Devuelve null si no hay nada que exportar.
+  async function prepararExportacionUI_(bancoKey, sel){
+    const items = sel.map(r=>({ fundacion:r.fundacion, rowNum:Number(r._rowNum), importe:Number(r.importe)||0 }));
+    let res;
+    try{ res = await runServer('prepararExportacion', bancoKey, items, nuevoRequestId_()); }
+    catch(err){
+      alert('No se pudo preparar la exportación: '+(err&&err.message||'error'));
+      await cargarExportacionesPendientes_(); // por si el servidor sí la dejó preparada
+      return null;
+    }
+    if(res.rechazadas && res.rechazadas.length){
+      alert('Estas facturas NO se incluyeron en la exportación:\n\n• '+res.rechazadas.map(x=>(x.proveedor||('fila '+x.rowNum))+': '+x.motivo).join('\n• '));
+    }
+    if(!res.exportacionId || !res.aprobadas || !res.aprobadas.length){ showToast('Ninguna factura pasó los controles: no se generó archivo.'); return null; }
+    return res;
+  }
+  // Si el archivo no se pudo generar o descargar, la exportación se anula (no hay nada que subir al banco).
+  async function generarOCancelar_(res, generar){
+    try{ await generar(); return true; }
+    catch(err){
+      try{ await runServer('cancelarExportacion', res.exportacionId); }catch(e){}
+      alert('No se pudo generar el archivo ('+(err&&err.message||'error')+'). La exportación se canceló y no se registró ningún pago. Si se alcanzó a descargar algún archivo, NO lo subas al banco.');
+      await cargarExportacionesPendientes_();
+      return false;
+    }
+  }
+  async function terminarExportacion_(res){
+    await cargarExportacionesPendientes_();
+    abrirConfirmacionExportacion_(res.exportacionId, res.banco, res.aprobadas);
+  }
+
+  /* ---- Diálogo de confirmación (exportación pendiente o pago directo de Caja/Tarjeta) ---- */
+  function pintarFilasConfirmacion_(lista){
     $('#confirmar-pagos-body').innerHTML = lista.map((r,i)=>`<tr>
       <td style="text-align:center"><input type="checkbox" class="confirmar-pago-check" data-idx="${i}" checked></td>
       <td>${escapeHtml(r.proveedor||'—')}</td>
       <td class="mono">${escapeHtml(r.numeroFactura||'')}</td>
       <td class="mono">${fmtMoney(r.importe)}${(r.saldoPrevio && r.importe < r.saldoPrevio-0.01) ? ' <span style="color:var(--media);font-size:11px;">(a cuenta)</span>' : ''}</td>
     </tr>`).join('');
-    $('#confirmar-pagos-overlay').dataset.lista = JSON.stringify(lista.map(r=>({fundacion:r.fundacion, rowNum:r._rowNum, proveedor:r.proveedor, importe:Number(r.importe)||0})));
-    $('#confirmar-pagos-overlay').dataset.banco = banco || '';
-    $('#confirmar-pagos-overlay').querySelector('.hint').textContent = banco
-      ? `Se tildaron todas por defecto y se van a marcar como pagadas vía "${banco}". Destildá las que no correspondan antes de confirmar.`
-      : `Se tildaron todas por defecto y se van a marcar como Pagadas. Destildá las que no correspondan antes de confirmar.`;
-    if(/U\$S/i.test(banco||'')) $('#confirmar-pagos-overlay').querySelector('.hint').textContent += ' ⚠ Es una caja en dólares: el importe registrado se descuenta del saldo en PESOS de la factura (cargá el equivalente en pesos en "A pagar").';
-    $('#confirmar-pagos-overlay').classList.remove('hidden');
+  }
+  function abrirConfirmacionExportacion_(id, banco, items){
+    if(!items || !items.length) return;
+    const lista = items.map(r=>({ fundacion:r.fundacion, rowNum:Number(r.rowNum), proveedor:r.proveedor, numeroFactura:r.numeroFactura, importe:Number(r.importe)||0, saldoPrevio:Number(r.saldoPrevio)||0 }));
+    const ov = $('#confirmar-pagos-overlay');
+    pintarFilasConfirmacion_(lista);
+    ov.dataset.lista = JSON.stringify(lista);
+    ov.dataset.banco = banco || '';
+    ov.dataset.exportacionId = id;
+    ov.querySelector('.hint').textContent = 'Exportación '+id+' a '+(banco||'Excel')+'. Dejá tildadas SOLO las facturas cuyo pago se subió al banco; los pagos se registran recién al confirmar. Si cerrás esta ventana, la exportación queda pendiente y se retoma desde el aviso amarillo de Transferencias.';
+    ov.classList.remove('hidden');
+  }
+  function abrirConfirmacionPagos(lista, banco){
+    if(!lista.length) return;
+    const filas = lista.map(r=>({ fundacion:r.fundacion, rowNum:Number(r._rowNum), proveedor:r.proveedor, numeroFactura:r.numeroFactura, importe:Number(r.importe)||0, saldoPrevio:Number(r.saldoPrevio)||0, requestId:nuevoRequestId_() }));
+    const ov = $('#confirmar-pagos-overlay');
+    pintarFilasConfirmacion_(filas);
+    ov.dataset.lista = JSON.stringify(filas);
+    ov.dataset.banco = banco || '';
+    ov.dataset.exportacionId = '';
+    ov.querySelector('.hint').textContent = `Se tildaron todas por defecto y se van a marcar como pagadas vía "${banco}". Destildá las que no correspondan antes de confirmar.`;
+    if(/U\$S/i.test(banco||'')) ov.querySelector('.hint').textContent += ' ⚠ Es una caja en dólares: el importe registrado se descuenta del saldo en PESOS de la factura (cargá el equivalente en pesos en "A pagar").';
+    ov.classList.remove('hidden');
   }
   $('#confirmar-pagos-close').addEventListener('click', ()=>$('#confirmar-pagos-overlay').classList.add('hidden'));
   $('#confirmar-pagos-cancelar').addEventListener('click', ()=>$('#confirmar-pagos-overlay').classList.add('hidden'));
-  $('#confirmar-pagos-aceptar').addEventListener('click', async ()=>{
-    const lista = JSON.parse($('#confirmar-pagos-overlay').dataset.lista || '[]');
-    const banco = $('#confirmar-pagos-overlay').dataset.banco || '';
-    const marcar = [];
-    $$('.confirmar-pago-check').forEach(chk=>{
-      if(chk.checked) marcar.push(lista[parseInt(chk.dataset.idx,10)]);
-    });
-    $('#confirmar-pagos-aceptar').disabled = true;
+
+  async function confirmarExportacionUI_(id, marcar){
+    const ov = $('#confirmar-pagos-overlay');
+    if(!marcar.length){
+      if(!confirm('No dejaste tildada ninguna factura.\n\nSi seguís, la exportación se CANCELA y no se registra ningún pago. Si ya subiste el archivo al banco, tenés que anular esa operación en el banco.\n\n¿Cancelar la exportación?')) return;
+      try{ await runServer('cancelarExportacion', id); ov.classList.add('hidden'); showToast('Exportación cancelada.'); }
+      catch(err){ alert('No se pudo cancelar: '+(err&&err.message||'error')); }
+      await cargarExportacionesPendientes_();
+      return;
+    }
+    let res;
+    try{
+      // Sin requestId a propósito: la confirmación es idempotente por estado en el servidor.
+      res = await runServer('confirmarExportacion', id, marcar.map(m=>({fundacion:m.fundacion, rowNum:m.rowNum})));
+    }catch(err){
+      alert('No se pudo confirmar ('+(err&&err.message||'error')+').\n\nLa exportación sigue pendiente: actualizá el panel (F5), fijate si se registraron pagos y volvé a confirmar desde el aviso de Transferencias.');
+      await cargarExportacionesPendientes_();
+      return;
+    }
+    ov.classList.add('hidden');
+    if(res.yaResuelta){ showToast('Esa exportación ya estaba resuelta ('+res.estado+').'); }
+    else{
+      showToast('Pagos registrados: '+(res.registrados||0)+(res.descartados? ' · descartados: '+res.descartados : '')+((res.fallidos||[]).length? ' · con error: '+res.fallidos.length : '')+'.');
+      const avisos = [];
+      if((res.fallidos||[]).length) avisos.push('No se pudieron registrar estos pagos:\n\n• '+res.fallidos.map(f=>(f.proveedor||'—')+' '+(f.numeroFactura||'')+': '+f.motivo).join('\n• ')+(res.sinCambios ? '\n\nNo se registró ninguno: la exportación sigue pendiente.' : '\n\nLos demás quedaron registrados.'));
+      if((res.pdfSinMarcar||[]).length) avisos.push('No se encontró el PDF para marcar como "OP finalizada" de: '+res.pdfSinMarcar.join(', '));
+      if(avisos.length) alert(avisos.join('\n\n'));
+    }
+    await cargarExportacionesPendientes_();
+    renderAll();
+    refreshAll();
+  }
+  async function confirmarPagosDirectos_(marcar, banco){
+    const ov = $('#confirmar-pagos-overlay');
     let ok=0, fallidos=0;
     const motivos = [];
     for(const item of marcar){
       try{
-        const res = await runServer('registrarPagoLote', item.fundacion, item.rowNum, item.importe, banco);
+        const res = await runServer('registrarPagoLote', item.fundacion, item.rowNum, item.importe, banco, item.requestId);
         ok++;
         aplicarPagoLocal_(item.fundacion, item.rowNum, item.importe, res);
       }catch(err){ fallidos++; motivos.push((item.proveedor||'—')+': '+(err && err.message ? err.message : 'error')); }
     }
-    $('#confirmar-pagos-aceptar').disabled = false;
-    $('#confirmar-pagos-overlay').classList.add('hidden');
+    ov.classList.add('hidden');
     showToast('Pagos registrados: '+ok+(fallidos? ' · '+fallidos+' con error':'')+'.');
     renderAll();
     if(motivos.length) alert('No se pudieron registrar estos pagos:\n\n• '+motivos.join('\n• '));
     refreshAll();
+  }
+  let confirmandoPagos_ = false;
+  $('#confirmar-pagos-aceptar').addEventListener('click', async ()=>{
+    if(confirmandoPagos_) return;
+    const ov = $('#confirmar-pagos-overlay');
+    const lista = JSON.parse(ov.dataset.lista || '[]');
+    const banco = ov.dataset.banco || '';
+    const expId = ov.dataset.exportacionId || '';
+    const marcar = [];
+    $$('.confirmar-pago-check').forEach(chk=>{ if(chk.checked) marcar.push(lista[parseInt(chk.dataset.idx,10)]); });
+    confirmandoPagos_ = true;
+    $('#confirmar-pagos-aceptar').disabled = true;
+    try{
+      if(expId) await confirmarExportacionUI_(expId, marcar);
+      else await confirmarPagosDirectos_(marcar, banco);
+    }finally{
+      confirmandoPagos_ = false;
+      $('#confirmar-pagos-aceptar').disabled = false;
+    }
   });
 
-  $('#btn-transf-exportar').addEventListener('click', async ()=>{
-    const sel = soloConCbu_(getTransfSeleccionadas());
+  /* ---- Botones de exportación ---- */
+  function hojaDe_(filas, headers, nombreHoja, archivo){
+    const ws = XLSX.utils.json_to_sheet(filas, {header:headers});
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, nombreHoja);
+    XLSX.writeFile(wb, archivo);
+  }
+  const HEADERS_GALICIA_ = ['CBU/CVU/Alias/Nro cuenta','Importe','Motivo','Descripción (opcional)','Email destinatario (opcional)','Mensaje del email (opcional)'];
+  async function exportarGaliciaOMercadoPago_(bancoKey, archivoPrefijo){
+    const sel = getTransfSeleccionadas();
     if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
     if(sel.length>50){ showToast('El banco acepta máximo 50 pagos por archivo. Desmarcá algunas.'); return; }
-    const filas = sel.map(r=>{
-      const match = findAgendaMatch(r.proveedor, r.cuit);
-      const cbu = match? match.cbu : '';
-      const numCorto = facturaNumeroCorto(r.numeroFactura);
-      const descripcion = ('FC '+numCorto).slice(0,12);
-      const mensajeFallback = ('OP - '+cbu+'- FCFactura - FC '+numCorto+' - $'+Math.round(Number(r.importe)||0));
-      const mensaje = (r.nombreArchivoPdf || mensajeFallback).slice(0,200);
+    const res = await prepararExportacionUI_(bancoKey, sel); if(!res) return;
+    const filas = res.aprobadas.map(a=>{
+      const numCorto = facturaNumeroCorto(a.numeroFactura);
+      const mensajeFallback = 'OP - '+a.cbu+'- FCFactura - FC '+numCorto+' - $'+Math.round(Number(a.importe)||0);
       return {
-        'CBU/CVU/Alias/Nro cuenta': cbu,
-        'Importe': Number(r.importe)||0,
-        'Motivo': (match && match.motivo) ? match.motivo : 'Factura',
-        'Descripción (opcional)': descripcion,
-        'Email destinatario (opcional)': match? (match.email||'') : '',
-        'Mensaje del email (opcional)': mensaje
+        'CBU/CVU/Alias/Nro cuenta': a.cbu,
+        'Importe': Number(a.importe)||0,
+        'Motivo': textoXlsx_(a.motivo || 'Factura'),
+        'Descripción (opcional)': ('FC '+numCorto).slice(0,12),
+        'Email destinatario (opcional)': a.email || '',
+        'Mensaje del email (opcional)': textoXlsx_(a.nombreArchivoPdf || mensajeFallback).slice(0,200)
       };
     });
-    const ws = XLSX.utils.json_to_sheet(filas, {header:['CBU/CVU/Alias/Nro cuenta','Importe','Motivo','Descripción (opcional)','Email destinatario (opcional)','Mensaje del email (opcional)']});
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Formulario');
-    const total = sel.reduce((s,r)=>s+(Number(r.importe)||0),0);
-    XLSX.writeFile(wb, 'TRANSF_BANCO_GALICIA_'+todayISO()+'.xlsx');
-    try{ await runServer('logExportTransferencias', sel.length, Math.round(total)); }catch(e){}
-    const marcados = await marcarPdfsComoOpFinalizada(sel);
-    showToast('Archivo generado: '+sel.length+' pago(s).'+(marcados.faltantes.length? ' ⚠️ '+marcados.faltantes.length+' PDF(s) no se encontraron para marcar.' : ''));
-    abrirConfirmacionPagos(sel, 'Banco Galicia');
-  });
-
-  async function marcarPdfsComoOpFinalizada(seleccionadas){
-    const faltantes = [];
-    for(const r of seleccionadas){
-      try{
-        const res = await runServer('marcarOpFinalizada', r.fundacion, r._rowNum);
-        if(!res || !res.ok) faltantes.push(r.proveedor);
-      }catch(err){ faltantes.push(r.proveedor); }
-    }
-    return { faltantes };
+    const ok = await generarOCancelar_(res, async ()=>{ hojaDe_(filas, HEADERS_GALICIA_, 'Formulario', archivoPrefijo+todayISO()+'.xlsx'); });
+    if(!ok) return;
+    showToast('Archivo generado: '+filas.length+' pago(s). Falta confirmar cuáles se subieron al banco.');
+    await terminarExportacion_(res);
   }
+  $('#btn-transf-exportar').addEventListener('click', ()=>exportarGaliciaOMercadoPago_('galicia','TRANSF_BANCO_GALICIA_'));
+  $('#btn-transf-exportar-mp').addEventListener('click', ()=>exportarGaliciaOMercadoPago_('mercadopago','TRANSF_MERCADOPAGO_'));
+
+  $('#btn-transf-exportar-excel').addEventListener('click', async ()=>{
+    const sel = getTransfSeleccionadas();
+    if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
+    const res = await prepararExportacionUI_('excel', sel); if(!res) return;
+    const headers = ['Fundación','Proveedor','CUIT','N° Factura','Importe','Saldo previo','CBU/CVU/Alias','Email'];
+    const filas = res.aprobadas.map(a=>({
+      'Fundación': (a.fundacion||'').toUpperCase(), 'Proveedor': textoXlsx_(a.proveedor), 'CUIT': a.cuit||'',
+      'N° Factura': a.numeroFactura||'', 'Importe': Number(a.importe)||0, 'Saldo previo': Number(a.saldoPrevio)||0,
+      'CBU/CVU/Alias': a.cbu||'', 'Email': a.email||''
+    }));
+    const ok = await generarOCancelar_(res, async ()=>{
+      const ws = XLSX.utils.json_to_sheet(filas, {header:headers});
+      ws['!autofilter'] = { ref: ws['!ref'] };
+      ws['!cols'] = headers.map(h => ({ wch: Math.max(12, h.length+2) }));
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Pagos');
+      XLSX.writeFile(wb, 'Pagos_'+todayISO()+'.xlsx');
+    });
+    if(!ok) return;
+    showToast('Exportado: '+filas.length+' fila(s). Falta confirmar cuáles se pagaron.');
+    await terminarExportacion_(res);
+  });
 
   $('#btn-transf-exportar-macro').addEventListener('click', (e)=>{
     e.stopPropagation();
@@ -1974,172 +2223,74 @@
     if(!sel.length){ showToast('Tildá al menos una factura para marcar como pagada.'); return; }
     abrirConfirmacionPagos(sel, btn.dataset.caja);
   }));
-
   $('#btn-tarjeta-corporativa').addEventListener('click', ()=>{
     const sel = getTransfSeleccionadas();
     if(!sel.length){ showToast('Tildá al menos una factura para marcar como pagada.'); return; }
     abrirConfirmacionPagos(sel, 'Tarjeta de Crédito Corporativa');
   });
 
-  $('#btn-macro-pago-proveedores').addEventListener('click', async ()=>{
+  // Cuentas del propio Banco Macro: CBU que empieza con 285 (código de entidad) o número de cuenta de 15 dígitos.
+  function esCuentaMacro_(digitos){ return (digitos.length===22 && digitos.indexOf('285')===0) || digitos.length===15; }
+  async function exportarMacro_(variante){
     $('#menu-macro').classList.add('hidden');
-    const sel = soloConCbu_(getTransfSeleccionadas());
+    const sel = getTransfSeleccionadas();
     if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
-    const sinCbu = [];
-    const filas = [];
-    sel.forEach(r=>{
-      const match = findAgendaMatch(r.proveedor, r.cuit);
-      const cbuDigits = (match? (match.cbu||'') : '').replace(/[^0-9]/g,'');
-      const esNumerico = cbuDigits.length>=15; // CBU (22) o Nro de cuenta (15) — Macro no acepta alias
-      if(!esNumerico){ sinCbu.push(r.proveedor); return; }
-      const cuitDigits = (r.cuit||'').replace(/[^0-9]/g,'');
-      const modalidad = cbuDigits.indexOf('0285')===0 ? '02' : '04'; // 02: cuenta Macro, 04: otros bancos
-      const numCorto = facturaNumeroCorto(r.numeroFactura);
-      filas.push({
-        'Modalidad de Pago': modalidad,
-        'Número de documento Beneficiario': cuitDigits,
-        'Denominación del Beneficiario': (r.proveedor||'').slice(0,120),
-        'Identificación del pago': ('FC '+numCorto).slice(0,30),
-        'Importe': Number(r.importe)||0,
-        'Cuenta de pago - Nro/CBU o Nº Cheque': cbuDigits,
-        'Marca de registración de cheque': '',
-        'Fecha de pago - Emisión': new Date().toLocaleDateString('es-AR'),
-        'Fecha de pago diferido': ''
-      });
-    });
-    if(!filas.length){ showToast('Ninguna seleccionada tiene CBU/cuenta numérica en la Agenda (Banco Macro no acepta alias).'); return; }
-    const ws = XLSX.utils.json_to_sheet(filas, {header:['Modalidad de Pago','Número de documento Beneficiario','Denominación del Beneficiario','Identificación del pago','Importe','Cuenta de pago - Nro/CBU o Nº Cheque','Marca de registración de cheque','Fecha de pago - Emisión','Fecha de pago diferido']});
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Plantilla');
-    XLSX.writeFile(wb, 'TRANSF_BANCO_MACRO_'+todayISO()+'.xlsx');
-    const total = filas.reduce((s,f)=>s+f['Importe'],0);
-    try{ await runServer('logExportTransferencias', filas.length, Math.round(total)); }catch(e){}
-    const incluidas = sel.filter(r=>{
-      const match = findAgendaMatch(r.proveedor, r.cuit);
-      return match && (match.cbu||'').replace(/[^0-9]/g,'').length>=15;
-    });
-    const marcados = await marcarPdfsComoOpFinalizada(incluidas);
-    if(sinCbu.length) showToast('⚠️ '+filas.length+' incluidas. '+sinCbu.length+' NO se incluyeron por no tener CBU numérico: '+sinCbu.slice(0,5).join(', ')+(sinCbu.length>5?'...':''));
-    else showToast('Archivo Banco Macro generado: '+filas.length+' pago(s).'+(marcados.faltantes.length? ' ⚠️ '+marcados.faltantes.length+' PDF(s) no se encontraron para marcar.':''));
-    abrirConfirmacionPagos(incluidas, 'Banco Macro');
-  });
-
-  $('#btn-macro-transf-masivas').addEventListener('click', async ()=>{
-    $('#menu-macro').classList.add('hidden');
-    const sel = soloConCbu_(getTransfSeleccionadas());
-    if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
-    const sinCbu = [];
-    const filas = [];
-    sel.forEach(r=>{
-      const match = findAgendaMatch(r.proveedor, r.cuit);
-      const cbuDigits = (match? (match.cbu||'') : '').replace(/[^0-9]/g,'');
-      const esNumerico = cbuDigits.length>=15;
-      if(!esNumerico){ sinCbu.push(r.proveedor); return; }
-      const cuitDigits = (r.cuit||'').replace(/[^0-9]/g,'');
-      const modalidad = cbuDigits.indexOf('0285')===0 ? '18' : '12'; // 18: cuentas Macro, 12: otros bancos
-      filas.push({
-        'Modalidad de Pago': modalidad,
-        'Número de documento Beneficiario': cuitDigits,
-        'Denominación del Beneficiario': (r.proveedor||'').slice(0,120),
-        'Concepto': 'FAC',
-        'Importe': Number(r.importe)||0,
-        'Cuenta Destino': cbuDigits,
-        'Fecha de pago - Emisión': new Date().toLocaleDateString('es-AR')
-      });
-    });
-    if(!filas.length){ showToast('Ninguna seleccionada tiene CBU/cuenta numérica en la Agenda (Banco Macro no acepta alias).'); return; }
-    const ws = XLSX.utils.json_to_sheet(filas, {header:['Modalidad de Pago','Número de documento Beneficiario','Denominación del Beneficiario','Concepto','Importe','Cuenta Destino','Fecha de pago - Emisión']});
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Plantilla');
-    XLSX.writeFile(wb, 'TRANSF_MASIVAS_MACRO_'+todayISO()+'.xlsx');
-    const total = filas.reduce((s,f)=>s+f['Importe'],0);
-    try{ await runServer('logExportTransferencias', filas.length, Math.round(total)); }catch(e){}
-    const incluidas = sel.filter(r=>{
-      const match = findAgendaMatch(r.proveedor, r.cuit);
-      return match && (match.cbu||'').replace(/[^0-9]/g,'').length>=15;
-    });
-    const marcados = await marcarPdfsComoOpFinalizada(incluidas);
-    if(sinCbu.length) showToast('⚠️ '+filas.length+' incluidas. '+sinCbu.length+' NO se incluyeron por no tener CBU numérico: '+sinCbu.slice(0,5).join(', ')+(sinCbu.length>5?'...':''));
-    else showToast('Archivo de Transferencias Masivas generado: '+filas.length+' pago(s).'+(marcados.faltantes.length? ' ⚠️ '+marcados.faltantes.length+' PDF(s) no se encontraron para marcar.':''));
-    abrirConfirmacionPagos(incluidas, 'Banco Macro');
-  });
-
-  $('#btn-transf-exportar-mp').addEventListener('click', async ()=>{
-    const sel = soloConCbu_(getTransfSeleccionadas());
-    if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
-    if(sel.length>50){ showToast('Máximo 50 pagos por archivo. Desmarcá algunas.'); return; }
-    const filas = sel.map(r=>{
-      const match = findAgendaMatch(r.proveedor, r.cuit);
-      const cbu = match? match.cbu : '';
-      const numCorto = facturaNumeroCorto(r.numeroFactura);
-      const descripcion = ('FC '+numCorto).slice(0,12);
-      const mensajeFallback = ('OP - '+cbu+'- FCFactura - FC '+numCorto+' - $'+Math.round(Number(r.importe)||0));
-      const mensaje = (r.nombreArchivoPdf || mensajeFallback).slice(0,200);
-      return {
-        'CBU/CVU/Alias/Nro cuenta': cbu,
-        'Importe': Number(r.importe)||0,
-        'Motivo': (match && match.motivo) ? match.motivo : 'Factura',
-        'Descripción (opcional)': descripcion,
-        'Email destinatario (opcional)': match? (match.email||'') : '',
-        'Mensaje del email (opcional)': mensaje
-      };
-    });
-    const ws = XLSX.utils.json_to_sheet(filas, {header:['CBU/CVU/Alias/Nro cuenta','Importe','Motivo','Descripción (opcional)','Email destinatario (opcional)','Mensaje del email (opcional)']});
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, 'Formulario');
-    const total = sel.reduce((s,r)=>s+(Number(r.importe)||0),0);
-    XLSX.writeFile(wb, 'TRANSF_MERCADOPAGO_'+todayISO()+'.xlsx');
-    try{ await runServer('logExportTransferencias', sel.length, Math.round(total)); }catch(e){}
-    const marcados = await marcarPdfsComoOpFinalizada(sel);
-    showToast('Archivo generado: '+sel.length+' pago(s).'+(marcados.faltantes.length? ' ⚠️ '+marcados.faltantes.length+' PDF(s) no se encontraron para marcar.' : ''));
-    abrirConfirmacionPagos(sel, 'Mercado Pago');
-  });
-
-
-  $('#btn-transf-exportar-provincia').addEventListener('click', async ()=>{
-    const sel = soloConCbu_(getTransfSeleccionadas());
-    if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
-    // Provincia exige UN convenio (una empresa/CUIT) por archivo, así que
-    // se separa automáticamente por fundación si hay una mezcla de MDG y RVP.
-    const porFundacion = {};
-    sel.forEach(r=>{ (porFundacion[r.fundacion] = porFundacion[r.fundacion]||[]).push(r); });
-
-    let huboExito = false;
-    const incluidasTotal = [];
-    for(const fundacion of Object.keys(porFundacion)){
-      const grupo = porFundacion[fundacion];
-      const pagos = grupo.map(r=>{
-        const match = findAgendaMatch(r.proveedor, r.cuit);
+    const res = await prepararExportacionUI_('macro', sel); if(!res) return;
+    const fecha = fechaHoyAR_();
+    let filas, headers, archivo;
+    if(variante==='pago-proveedores'){
+      headers = ['Modalidad de Pago','Número de documento Beneficiario','Denominación del Beneficiario','Identificación del pago','Importe','Cuenta de pago - Nro/CBU o Nº Cheque','Marca de registración de cheque','Fecha de pago - Emisión','Fecha de pago diferido'];
+      archivo = 'TRANSF_BANCO_MACRO_'+todayISO()+'.xlsx';
+      filas = res.aprobadas.map(a=>{
+        const cuenta = String(a.cbu||'').replace(/[^0-9]/g,'');
         return {
-          cbu: match? (match.cbu||'') : '',
-          importe: Number(r.importe)||0,
-          cuit: r.cuit||'',
-          nombre: r.proveedor||'',
-          referencia: ('FC '+facturaNumeroCorto(r.numeroFactura)).slice(0,15),
-          _rec: r
+          'Modalidad de Pago': esCuentaMacro_(cuenta) ? '02' : '04', // 02: cuenta Macro, 04: otros bancos
+          'Número de documento Beneficiario': String(a.cuit||'').replace(/[^0-9]/g,''),
+          'Denominación del Beneficiario': textoXlsx_(a.proveedor).slice(0,120),
+          'Identificación del pago': ('FC '+facturaNumeroCorto(a.numeroFactura)).slice(0,30),
+          'Importe': Number(a.importe)||0,
+          'Cuenta de pago - Nro/CBU o Nº Cheque': cuenta,
+          'Marca de registración de cheque': '',
+          'Fecha de pago - Emisión': fecha,
+          'Fecha de pago diferido': ''
         };
       });
-      try{
-        const res = await runServer('generarArchivoBancoProvincia', fundacion, pagos.map(p=>({cbu:p.cbu, importe:p.importe, cuit:p.cuit, nombre:p.nombre, referencia:p.referencia})));
-        const blob = new Blob([res.contenido], {type:'text/plain;charset=utf-8'});
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url; a.download = 'TRANSF_BANCO_PROVINCIA_'+res.rotulo+'_'+fundacion.toUpperCase()+'_'+todayISO()+'.txt';
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        try{ await runServer('logExportTransferencias', res.cantidadPagos, Math.round(res.importeTotal)); }catch(e){}
-        const cbusValidos = pagos.filter(p=>normalizarCuitCliente(p.cbu).length===22).map(p=>p._rec);
-        const marcados = await marcarPdfsComoOpFinalizada(cbusValidos);
-        incluidasTotal.push(...cbusValidos);
-        huboExito = true;
-        showToast('Banco Provincia ('+FUNDACION_INFO_LABEL(fundacion)+'): '+res.cantidadPagos+' pago(s) generado(s).'+(res.excluidos? ' ⚠️ '+res.excluidos+' excluido(s) por no tener CBU numérico completo.':'')+(marcados.faltantes.length? ' ⚠️ '+marcados.faltantes.length+' PDF(s) no encontrados.':''));
-      }catch(err){
-        showToast('Banco Provincia ('+(FUNDACION_INFO_LABEL?FUNDACION_INFO_LABEL(fundacion):fundacion)+'): '+(err.message||'error al generar el archivo.'));
-      }
+    } else {
+      headers = ['Modalidad de Pago','Número de documento Beneficiario','Denominación del Beneficiario','Concepto','Importe','Cuenta Destino','Fecha de pago - Emisión'];
+      archivo = 'TRANSF_MASIVAS_MACRO_'+todayISO()+'.xlsx';
+      filas = res.aprobadas.map(a=>{
+        const cuenta = String(a.cbu||'').replace(/[^0-9]/g,'');
+        return {
+          'Modalidad de Pago': esCuentaMacro_(cuenta) ? '18' : '12', // 18: cuentas Macro, 12: otros bancos
+          'Número de documento Beneficiario': String(a.cuit||'').replace(/[^0-9]/g,''),
+          'Denominación del Beneficiario': textoXlsx_(a.proveedor).slice(0,120),
+          'Concepto': 'FAC',
+          'Importe': Number(a.importe)||0,
+          'Cuenta Destino': cuenta,
+          'Fecha de pago - Emisión': fecha
+        };
+      });
     }
-    if(huboExito) abrirConfirmacionPagos(incluidasTotal, 'Banco Provincia');
+    const ok = await generarOCancelar_(res, async ()=>{ hojaDe_(filas, headers, 'Plantilla', archivo); });
+    if(!ok) return;
+    showToast('Archivo Banco Macro generado: '+filas.length+' pago(s). Falta confirmar cuáles se subieron al banco.');
+    await terminarExportacion_(res);
+  }
+  $('#btn-macro-pago-proveedores').addEventListener('click', ()=>exportarMacro_('pago-proveedores'));
+  $('#btn-macro-transf-masivas').addEventListener('click', ()=>exportarMacro_('masivas'));
+
+  $('#btn-transf-exportar-provincia').addEventListener('click', async ()=>{
+    const sel = getTransfSeleccionadas();
+    if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
+    // Provincia exige UN convenio (una empresa/CUIT) por archivo: el servidor arma un archivo por fundación
+    // con lo que dejó guardado en la exportación (no con datos del navegador).
+    const res = await prepararExportacionUI_('provincia', sel); if(!res) return;
+    const fundaciones = Array.from(new Set(res.aprobadas.map(a=>a.fundacion)));
+    const ok = await generarOCancelar_(res, async ()=>{ await descargarArchivosProvincia_(res.exportacionId, fundaciones); });
+    if(!ok) return;
+    showToast('Banco Provincia: archivo(s) generado(s) ('+fundaciones.map(FUNDACION_INFO_LABEL).join(' y ')+'). Falta confirmar cuáles se subieron al banco.');
+    await terminarExportacion_(res);
   });
-  function normalizarCuitCliente(s){ return String(s||'').replace(/[^0-9]/g,''); }
   function FUNDACION_INFO_LABEL(fk){ return fk==='mdg' ? 'MDG' : (fk==='rvp' ? 'RVP' : fk); }
 
   /* ---------------- CLASIFICACIÓN (proveedores + lista maestra) ---------------- */
@@ -2331,8 +2482,8 @@
 
   /* ---------------- VERIFICAR ARCA ---------------- */
   function formatearPtoVtaNumero_(pv, num){
-    const pvStr = String(pv||'').padStart(4,'0');
-    const numStr = String(num||'').padStart(8,'0');
+    const pvStr = String(pv||'').replace(/\D/g,'').replace(/^0+/,'').padStart(4,'0');
+    const numStr = String(num||'').replace(/\D/g,'').replace(/^0+/,'').padStart(8,'0');
     return pvStr+'-'+numStr;
   }
   function mapearTipoArca_(tipoTexto){
@@ -2364,6 +2515,98 @@
   }
   $('#arca-import-fundacion').addEventListener('change', renderArca);
 
+  /* Lectura del Excel de ARCA ("Mis Comprobantes Recibidos"): se buscan las columnas por el nombre de su
+     encabezado (si ARCA agrega o mueve una columna no se corren los datos) y cada fila se valida. */
+  const ARCA_COLUMNAS_ = [
+    // [campo, encabezado, posición histórica, obligatoria]
+    ['fecha',              /^fecha/i,                                   0, true],
+    ['tipo',               /^tipo(\s+de)?\s+comprobante$|^tipo$/i,      1, true],
+    ['puntoVenta',         /punto\s+de\s+venta/i,                       2, true],
+    ['numeroDesde',        /n[uú]mero\s+desde|^n[uú]mero$/i,            3, true],
+    ['numeroHasta',        /n[uú]mero\s+hasta/i,                        4, false],
+    ['cae',                /c[oó]d\.?\s*autorizaci[oó]n|^cae$/i,        5, true],
+    ['cuitEmisor',         /nro\.?\s*doc\.?\s*emisor|cuit\s+emisor/i,   7, true],
+    ['denominacionEmisor', /denominaci[oó]n\s+emisor/i,                 8, true],
+    ['cuitReceptor',       /nro\.?\s*doc\.?\s*receptor|cuit\s+receptor/i, 10, false],
+    ['moneda',             /^moneda$/i,                                -1, false],
+    ['importeTotal',       /^imp\.?\s*total|importe\s+total/i,         29, true]
+  ];
+  function arcaFechaIso_(v){
+    if(v instanceof Date && !isNaN(v)) return v.getFullYear()+'-'+String(v.getMonth()+1).padStart(2,'0')+'-'+String(v.getDate()).padStart(2,'0');
+    if(typeof v==='number' && isFinite(v) && v>20000 && v<80000){ // número de serie de Excel
+      const d = new Date(Math.round((v-25569)*86400000));
+      return d.getUTCFullYear()+'-'+String(d.getUTCMonth()+1).padStart(2,'0')+'-'+String(d.getUTCDate()).padStart(2,'0');
+    }
+    const t = String(v==null?'':v).trim();
+    let m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(t);
+    if(m){ const d=+m[1], mo=+m[2]; const chk = new Date(+m[3], mo-1, d); if(mo<1||mo>12||chk.getFullYear()!==+m[3]||chk.getMonth()!==mo-1||chk.getDate()!==d) return ''; return m[3]+'-'+String(mo).padStart(2,'0')+'-'+String(d).padStart(2,'0'); }
+    m = /^(\d{4})-(\d{2})-(\d{2})/.exec(t);
+    return m ? (m[1]+'-'+m[2]+'-'+m[3]) : '';
+  }
+  function arcaMonto_(v){
+    if(typeof v==='number') return isFinite(v) ? v : NaN;
+    let t = String(v==null?'':v).replace(/[\s$]/g,'');
+    if(!t) return NaN;
+    if(t.indexOf(',')>-1) t = t.replace(/\./g,'').replace(',','.'); // 1.234,56 → 1234.56
+    const n = Number(t);
+    return isFinite(n) ? n : NaN;
+  }
+  function leerArcaDeFilas_(rows){
+    const avisos = [], omitidas = [];
+    // 1) fila de encabezados: una de las primeras 10 que nombre varias columnas conocidas
+    let filaEnc = -1;
+    for(let i=0; i<Math.min(rows.length,10) && filaEnc<0; i++){
+      const celdas = (rows[i]||[]).map(c=>String(c==null?'':c).trim());
+      const claves = [ARCA_COLUMNAS_[0], ARCA_COLUMNAS_[1], ARCA_COLUMNAS_[2], ARCA_COLUMNAS_[5]];
+      if(claves.filter(c=>celdas.some(x=>c[1].test(x))).length>=3) filaEnc = i;
+    }
+    const idx = {};
+    if(filaEnc<0){
+      avisos.push('No se encontró la fila de encabezados: se usaron las posiciones de columna habituales. Verificá el resultado.');
+      filaEnc = 1;
+      ARCA_COLUMNAS_.forEach(c=>{ if(c[2]>=0) idx[c[0]] = c[2]; });
+    } else {
+      const celdas = (rows[filaEnc]||[]).map(c=>String(c==null?'':c).trim());
+      ARCA_COLUMNAS_.forEach(c=>{
+        const pos = celdas.findIndex(x=>c[1].test(x));
+        if(pos>-1) idx[c[0]] = pos;
+        else if(c[3] && c[2]>=0){ idx[c[0]] = c[2]; avisos.push('No se encontró la columna "'+c[0]+'": se usó la posición '+(c[2]+1)+'.'); }
+      });
+    }
+    const get = (r, campo)=> (idx[campo]==null ? '' : r[idx[campo]]);
+    const datos = [];
+    rows.slice(filaEnc+1).forEach((r, k)=>{
+      if(!r || !r.some(c=>String(c==null?'':c).trim()!=='')) return;
+      const nFila = filaEnc+k+2; // número de fila tal como se ve en Excel
+      const cae = String(get(r,'cae')).replace(/\D/g,'');
+      if(!cae){ return; } // renglones de totales / vacíos: no son comprobantes
+      const fecha = arcaFechaIso_(get(r,'fecha'));
+      const cuit = String(get(r,'cuitEmisor')).replace(/\D/g,'');
+      const importe = arcaMonto_(get(r,'importeTotal'));
+      const moneda = String(get(r,'moneda')||'').trim();
+      let motivo = '';
+      if(!/^\d{14}$/.test(cae)) motivo = 'CAE inválido';
+      else if(!fecha) motivo = 'fecha inválida';
+      else if(cuit.length!==11) motivo = 'CUIT del emisor inválido';
+      else if(isNaN(importe)) motivo = 'importe inválido';
+      else if(moneda && !/^(PES|ARS|\$|PESOS?)$/i.test(moneda)) motivo = 'moneda distinta de pesos ('+moneda+')';
+      if(motivo){ omitidas.push({fila:nFila, motivo}); return; }
+      datos.push({
+        fecha: fecha,
+        tipo: String(get(r,'tipo')).trim(),
+        puntoVenta: String(get(r,'puntoVenta')).trim(),
+        numeroDesde: String(get(r,'numeroDesde')).trim(),
+        numeroHasta: String(get(r,'numeroHasta')).trim(),
+        cae: cae,
+        cuitEmisor: String(get(r,'cuitEmisor')).trim(),
+        denominacionEmisor: String(get(r,'denominacionEmisor')).trim(),
+        cuitReceptor: String(get(r,'cuitReceptor')).trim(),
+        importeTotal: importe
+      });
+    });
+    return { datos, omitidas, avisos };
+  }
+
   $('#btn-arca-importar').addEventListener('click', ()=> $('#input-arca-importar').click());
   $('#input-arca-importar').addEventListener('change', async (e)=>{
     const file = e.target.files[0]; if(!file) return;
@@ -2377,24 +2620,13 @@
       const wb = XLSX.read(buf, {type:'array'});
       const sheet = wb.Sheets[wb.SheetNames[0]];
       const rows = XLSX.utils.sheet_to_json(sheet, {header:1, defval:''});
-      const datos = rows.slice(2).map(r=>{
-        const fechaRaw = String(r[0]||'').trim();
-        let fechaIso = '';
-        const partes = fechaRaw.split('/');
-        if(partes.length===3) fechaIso = partes[2]+'-'+String(partes[1]).padStart(2,'0')+'-'+String(partes[0]).padStart(2,'0');
-        return {
-          fecha: fechaIso,
-          tipo: String(r[1]||'').trim(),
-          puntoVenta: String(r[2]||'').trim(),
-          numeroDesde: String(r[3]||'').trim(),
-          numeroHasta: String(r[4]||'').trim(),
-          cae: String(r[5]||'').trim(),
-          cuitEmisor: String(r[7]||'').trim(),
-          denominacionEmisor: String(r[8]||'').trim(),
-          cuitReceptor: String(r[10]||'').trim(),
-          importeTotal: Number(r[29])||0
-        };
-      }).filter(d=>d.cae);
+      const lectura = leerArcaDeFilas_(rows);
+      const datos = lectura.datos;
+      if(lectura.omitidas.length || lectura.avisos.length){
+        const det = lectura.avisos.concat(lectura.omitidas.slice(0,15).map(o=>'Fila '+o.fila+': '+o.motivo));
+        const hayMas = lectura.omitidas.length>15 ? '\n... y '+(lectura.omitidas.length-15)+' más' : '';
+        if(!confirm('Revisá antes de importar'+(lectura.omitidas.length? ' ('+lectura.omitidas.length+' fila(s) se van a omitir)':'')+':\n\n• '+det.join('\n• ')+hayMas+'\n\nSe importarían '+datos.length+' comprobante(s).\n\n¿Continuar?')){ statusEl.textContent='Importación cancelada.'; return; }
+      }
       if(!datos.length){ statusEl.textContent = '⚠️ No se encontraron filas válidas en el archivo (¿es el formato correcto de ARCA?).'; return; }
       statusEl.innerHTML = '<span class="spinner"></span>Importando '+datos.length+' comprobante(s)...';
       const resR = await callSeguro('importArcaComprobantes', fundacion, datos);
@@ -2579,10 +2811,17 @@
     const seleccionadas = [];
     $$('.arca-sincoincidir-check').forEach(chk=>{ if(chk.checked) seleccionadas.push(arcaSinCoincidir[parseInt(chk.dataset.idx,10)]); });
     if(!seleccionadas.length){ showToast('Tildá al menos un comprobante para incorporar.'); return; }
-    arcaIncorporarLista = seleccionadas;
-    arcaIncorporarDatos = seleccionadas.map(a=>{
+    // Notas de crédito y tipos no reconocidos no se pueden cargar como factura a pagar.
+    const noIncorporables = seleccionadas.filter(a=>{ const t = mapearTipoArca_(a.tipo); return t==='NC' || t===''; });
+    if(noIncorporables.length){
+      alert('Estos comprobantes NO se pueden incorporar como factura (son notas de crédito u otro tipo que el panel no reconoce). Cargalos a mano:\n\n• '+noIncorporables.map(a=>(a.denominacionEmisor||'—')+' — '+(a.tipo||'sin tipo')+' '+formatearPtoVtaNumero_(a.puntoVenta,a.numeroDesde)).join('\n• '));
+    }
+    const incorporables = seleccionadas.filter(a=>!noIncorporables.includes(a));
+    if(!incorporables.length) return;
+    arcaIncorporarLista = incorporables;
+    arcaIncorporarDatos = incorporables.map(a=>{
       const match = proveedoresClasif.find(p=>normCuit_(p.cuit)===normCuit_(a.cuitEmisor));
-      return { centroCosto:'', clasificacionFlujo: match? (match.clasificacion||'') : '', prioridad:'media', descripcion:'', pagada:true, medioDePago:'' };
+      return { centroCosto:'', clasificacionFlujo: match? (match.clasificacion||'') : '', prioridad:'media', descripcion:'', pagada:false, medioDePago:'' };
     });
     arcaIncorporarIdx = 0;
     abrirArcaIncorporarPaso();
@@ -2595,7 +2834,9 @@
     $('#arca-inc-centrocosto').value = d.centroCosto;
     $('#arca-inc-clasificacion').value = d.clasificacionFlujo;
     $('#arca-inc-descripcion').value = d.descripcion;
-    $('#arca-inc-pagada').checked = d.pagada;
+    $('#arca-inc-pagada').disabled = !soyAdmin;
+    $('#arca-inc-pagada').title = soyAdmin ? '' : 'Solo un administrador puede incorporar una factura ya pagada';
+    $('#arca-inc-pagada').checked = soyAdmin && !!d.pagada;
     $('#arca-inc-medio-pago').value = d.medioDePago;
     arcaIncPrio = d.prioridad;
     $$('#arca-inc-prio-select .prio-opt').forEach(o=>o.classList.toggle('selected', o.dataset.p===arcaIncPrio));
@@ -2610,7 +2851,7 @@
       clasificacionFlujo: $('#arca-inc-clasificacion').value,
       prioridad: arcaIncPrio,
       descripcion: $('#arca-inc-descripcion').value,
-      pagada: $('#arca-inc-pagada').checked,
+      pagada: soyAdmin && $('#arca-inc-pagada').checked,
       medioDePago: $('#arca-inc-medio-pago').value
     };
   }
@@ -2649,6 +2890,7 @@
     }
     $('#arca-inc-confirmar-final').disabled = true;
     let ok=0, error=0;
+    const fallos = [];
     for(let i=0;i<arcaIncorporarLista.length;i++){
       const a = arcaIncorporarLista[i], d = arcaIncorporarDatos[i];
       const rec = {
@@ -2659,18 +2901,20 @@
         prioridad: d.prioridad, canal:'presencial',
         centroCosto: d.centroCosto, clasificacionFlujo: d.clasificacionFlujo,
         fileBase64:'', fileMediaType:'',
-        pagado: !!d.pagada,
-        medioDePago: d.pagada ? (d.medioDePago||'') : '',
-        estadoInicial: d.pagada ? 'completado' : 'pendiente',
+        pagado: !!(soyAdmin && d.pagada),
+        medioDePago: (soyAdmin && d.pagada) ? (d.medioDePago||'') : '',
+        estadoInicial: (soyAdmin && d.pagada) ? 'completado' : 'pendiente',
         fechaRecibida: a.fecha || todayISO(),
-        fechaResuelta: d.pagada ? todayISO() : ''
+        fechaResuelta: (soyAdmin && d.pagada) ? todayISO() : ''
       };
+      rec.requestId = d.requestId = (d.requestId || nuevoRequestId_());
       try{ await runServer('addRecord', rec); ok++; }
-      catch(err){ error++; console.error('Error incorporando comprobante ARCA', a, err); }
+      catch(err){ error++; fallos.push((a.denominacionEmisor||'—')+' '+formatearPtoVtaNumero_(a.puntoVenta,a.numeroDesde)+': '+(err&&err.message||'error')); console.error('Error incorporando comprobante ARCA', a, err); }
     }
     $('#arca-inc-confirmar-final').disabled = false;
     $('#arca-incorporar-overlay').classList.add('hidden');
     showToast('Incorporadas: '+ok+(error? ' · '+error+' con error':'')+'.');
+    if(fallos.length) alert('No se pudieron incorporar:\n\n• '+fallos.join('\n• '));
     await refreshAll();
     $('#btn-arca-controlar').click();
   });

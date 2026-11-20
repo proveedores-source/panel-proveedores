@@ -1229,9 +1229,15 @@
     return html;
   }
   $('#btn-cambiar-usuario').addEventListener('click', ()=>{
-    const urlActual = window.location.href.split('#')[0];
-    window.location.href = 'https://accounts.google.com/AccountChooser?continue=' + encodeURIComponent(urlActual);
-  });
+  const irASelector = (continuar) => {
+    const destino = 'https://accounts.google.com/AccountChooser' + (continuar ? '?continue=' + encodeURIComponent(continuar) : '');
+    window.open(destino, '_top'); // '_top': el selector de Google no puede abrirse dentro del iframe de Apps Script
+  };
+  google.script.run
+    .withSuccessHandler(url => irASelector(url))
+    .withFailureHandler(() => irASelector(''))
+    .getWebAppUrl();
+});
 
   $('#btn-revisar-comprobantes').addEventListener('click', async ()=>{
     const statusEl = $('#comprobantes-status');

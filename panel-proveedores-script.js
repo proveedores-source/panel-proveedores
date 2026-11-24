@@ -93,7 +93,7 @@
     return Promise.race([llamada, timeout]).finally(()=>clearTimeout(timer));
   }
 
-  const CLIENT_VERSION = 'v2026-11-24-lote9-a'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-11-24-lote10-a'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -165,6 +165,35 @@
     renderLog();
   }
   async function cargarLogSiHaceFalta(){ if(!logCargado) await cargarLog_(); }
+
+  /* ---- Centro de Costo y Clasificación de flujo: obligatorios para avanzar ---- */
+  function cartelBloqueo_(motivo){
+    alert('⛔ NO SE PUEDE AVANZAR\n\n'+motivo+'\n\nCompletá esos datos y volvé a intentar. La operación NO se grabó.');
+  }
+  function faltaClasif_(centro, clasif){
+    const f=[]; if(!String(centro||'').trim()) f.push('Centro de Costo'); if(!String(clasif||'').trim()) f.push('Clasificación de flujo'); return f;
+  }
+  function esBloqueoServidor_(err){ return /NO SE PUEDE AVANZAR/.test((err&&err.message)||''); }
+  function avisarBloqueoServidor_(err){ alert('⛔ '+String(err.message||'').replace(/^NO SE PUEDE AVANZAR:?\s*/,'NO SE PUEDE AVANZAR\n\n')+'\n\nLa operación NO se grabó.'); }
+  function sinClasificar_(r){
+    return !!r.isAppRecord && r.estado!=='eliminado' && r.estado!=='completado' && !r.pagado && faltaClasif_(r.centroCosto, r.clasificacionFlujo).length>0;
+  }
+  let soloSinClasificar_ = false;
+  function renderSinClasificar_(){
+    const vista = $('#view-listado'); if(!vista) return;
+    let el = $('#sin-clasif-banner');
+    if(!el){
+      el = document.createElement('div'); el.id='sin-clasif-banner';
+      el.style.cssText='display:none;margin:0 0 12px;padding:10px 12px;border:1px solid var(--alta);background:var(--alta-soft);border-radius:8px;font-size:13px;';
+      vista.insertBefore(el, vista.firstChild);
+      el.addEventListener('click',(e)=>{ if(!e.target.closest('button')) return; soloSinClasificar_ = !soloSinClasificar_; renderSinClasificar_(); renderListado(); });
+    }
+    const n = records.filter(sinClasificar_).length;
+    if(!n && !soloSinClasificar_){ el.style.display='none'; el.innerHTML=''; return; }
+    el.style.display='block';
+    el.innerHTML = '<b>⚠ '+n+' registro(s) sin Centro de Costo o Clasificación de flujo.</b> No se pueden pagar hasta completarlos (botón Editar). '+
+      '<button type="button" class="btn" style="margin-left:8px;">'+(soloSinClasificar_?'Ver todos':'Ver solo esos')+'</button>';
+  }
 
   // Una sola recarga a la vez: si piden otra mientras corre, se repite al terminar (evita lecturas superpuestas).
   let refreshEnCurso_ = null, refreshRepetir_ = false;
@@ -261,7 +290,7 @@
     }
   }
 
-  function renderAll(){ renderCounters(); renderKanban(); renderDashboard(); renderListado(); renderNotas(); renderNotasTabla(); renderAgenda(); renderTransferencias(); renderLog(); renderProvClasif(); renderClasif(); renderArca(); renderMediosPago(); }
+  function renderAll(){ renderCounters(); renderKanban(); renderDashboard(); renderListado(); renderNotas(); renderNotasTabla(); renderAgenda(); renderTransferencias(); renderLog(); renderProvClasif(); renderClasif(); renderArca(); renderMediosPago(); renderSinClasificar_(); }
 
   /* ---------------- USUARIOS (solo admins) ---------------- */
   async function refreshUsuarios(){
@@ -508,6 +537,8 @@
       if($('#f-tipofactura').value!=='Boleta' && !$('#f-cae').value.trim()) faltantes.push('CAE');
       if($('#f-tipofactura').value==='Boleta' && !$('#f-vencimiento').value) faltantes.push('Fecha de vencimiento (Boleta)');
     }
+    const faltClasifAlta = faltaClasif_(centroCosto, clasificacionFlujo);
+    if(faltClasifAlta.length){ cartelBloqueo_('Falta completar: '+faltClasifAlta.join(' y ')+'.\nSin esos datos no se puede registrar la '+(tipo==='factura'?'factura':'compra/operación')+', porque después es muy difícil rastrearla.'); return; }
     if(faltantes.length){
       alert('Faltan completar estos campos obligatorios:\n\n• '+faltantes.join('\n• '));
       return;
@@ -565,7 +596,7 @@
           }
         }
       }
-    }catch(err){ if(/DUPLICADO/.test(err.message||'')) alert(err.message); else showToast('No se pudo guardar: '+(err.message||'error')); }
+    }catch(err){ if(/DUPLICADO/.test(err.message||'')) alert(err.message); else if(esBloqueoServidor_(err)) avisarBloqueoServidor_(err); else showToast('No se pudo guardar: '+(err.message||'error')); }
   });
 
   /* ---------------- TABS ---------------- */
@@ -763,7 +794,7 @@
       showToast(res.completado ? 'Registrado. Saldo $0: la factura quedó pagada por completo.' : 'Registrado. Saldo pendiente: '+fmtMoney(res.saldo));
       aplicarPagoLocal_(fundSel, filaSel, datos.importe, res);
       closeModal(); renderAll(); refreshAll();
-    }catch(err){ showToast(err.message||'No se pudo registrar.'); }
+    }catch(err){ if(esBloqueoServidor_(err)) avisarBloqueoServidor_(err); else showToast(err.message||'No se pudo registrar.'); }
     btn.disabled = false;
   });
   $('#e-ctrl-autorizar').addEventListener('click', async ()=>{
@@ -789,6 +820,8 @@
     if(!editingId) return;
     const tipo = $('#e-tipo').value;
     const proveedorNuevo = $('#e-proveedor').value.trim();
+    const faltClasifEd = faltaClasif_($('#e-centrocosto').value, $('#e-clasificacion').value);
+    if(faltClasifEd.length){ cartelBloqueo_('Falta completar: '+faltClasifEd.join(' y ')+'.\nSin esos datos no se puede guardar este registro.'); return; }
     const patch = editingKind==='factura' ? {
       proveedor:proveedorNuevo, cuit:$('#e-cuit').value.trim(),
       importe:parseFloat($('#e-importe').value)||0,
@@ -826,7 +859,7 @@
     try{
       await runServer('updateRecordRouter', editingKind, editingFundacion, editingId, patch, `Editó registro de "${proveedorNuevo}"`);
       showToast('Cambios guardados.'); closeModal(); refreshAll();
-    }catch(err){ if(/DUPLICADO/.test(err.message||'')) alert(err.message); else showToast('No se pudo guardar: '+(err.message||'error')); }
+    }catch(err){ if(/DUPLICADO/.test(err.message||'')) alert(err.message); else if(esBloqueoServidor_(err)) avisarBloqueoServidor_(err); else showToast('No se pudo guardar: '+(err.message||'error')); }
   });
   $('#btn-delete').addEventListener('click', async ()=>{
     if(!editingId && editingId!==0) return;
@@ -967,11 +1000,13 @@
   function getListadoFiltered(){
     const fund = $('#listado-filt-fundacion').value, prio = $('#listado-filt-prioridad').value, est = $('#listado-filt-estado').value;
     const clasif = $('#listado-filt-clasificacion').value;
+    const soloSC = soloSinClasificar_;
     const activo = $('#listado-filt-activo').value; // activas | eliminadas | todas
     const q = sinTildes_($('#listado-buscar').value);
     return records.filter(r=>
       (activo==='todas' || (activo==='eliminadas' ? r.estado==='eliminado' : r.estado!=='eliminado')) &&
       (!fund || r.fundacion===fund) && (!prio || r.prioridad===prio) && (!est || r.estado===est) &&
+      (!soloSC || sinClasificar_(r)) &&
       (!clasif || r.clasificacionFlujo===clasif) &&
       (!listadoFechaDesde || (r.fechaRecibida && r.fechaRecibida>=listadoFechaDesde)) &&
       (!listadoFechaHasta || (r.fechaRecibida && r.fechaRecibida<=listadoFechaHasta)) &&
@@ -1100,7 +1135,7 @@
     $$('[data-pagado]').forEach(chk=>chk.addEventListener('change', async ()=>{
       const [kind, fund, rowNum] = chk.dataset.pagado.split(':');
       try{ await runServer('setPagadoRouter', kind, fund, parseInt(rowNum,10), chk.checked); showToast(chk.checked?'Marcado como pagado/completado.':'Desmarcado.'); refreshAll(); }
-      catch(err){ showToast('Error: '+(err.message||'')); chk.checked = !chk.checked; }
+      catch(err){ if(esBloqueoServidor_(err)) avisarBloqueoServidor_(err); else showToast('Error: '+(err.message||'')); chk.checked = !chk.checked; }
     }));
     $$('[data-edit]').forEach(b=>b.addEventListener('click',()=>openEditModal(b.dataset.edit)));
   }

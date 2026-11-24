@@ -93,7 +93,7 @@
     return Promise.race([llamada, timeout]).finally(()=>clearTimeout(timer));
   }
 
-  const CLIENT_VERSION = 'v2026-11-19-lote5-a'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-11-24-lote9-a'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -674,6 +674,7 @@
     $('#e-cp-preview').textContent = 'Quedará registrado: «Prioridad bajada de alta a '+editSelectedPrio+' el '+(fmtFechaAR_(fecha)||'[fecha]')+' con autorización de '+(quien||'[nombre y área]')+', confirmada por '+(medio||'[mail / WhatsApp / en persona]')+'.»';
   }
   ['e-cp-quien','e-cp-medio','e-cp-fecha'].forEach(id=>{ const el=document.getElementById(id); el.addEventListener('input',actualizarCambioPrio_); el.addEventListener('change',actualizarCambioPrio_); });
+  let editTipoFacturaOrig_ = '', editFechaEmisionOrig_ = '';
   function openEditModal(key){
     const r = records.find(x=>x._key===key); if(!r) return;
     editingKind = r.tipo==='factura' ? 'factura' : 'otro';
@@ -682,6 +683,9 @@
     $('#e-tipo').value=r.tipo; $('#e-fuente').value=r.fuente||'email'; $('#e-proveedor').value=r.proveedor||'';
     $('#e-cuit').value=formatearCuit_(r.cuit||''); $('#e-importe').value=r.importe||'';
     $('#e-numfactura').value=r.numeroFactura||''; $('#e-cae').value=r.cae||'';
+    editTipoFacturaOrig_ = r.tipoFactura||''; editFechaEmisionOrig_ = String(r.fechaEmision||'').slice(0,10);
+    $('#e-tipofactura').value = ['A','B','C','NC','Boleta'].indexOf(editTipoFacturaOrig_)>=0 ? editTipoFacturaOrig_ : '';
+    $('#e-fechaemision').value = editFechaEmisionOrig_;
     $('#e-numcomprobante').value=r.numeroComprobante||'';
     $('#e-centrocosto').value=r.centroCosto||''; $('#e-clasificacion').value=r.clasificacionFlujo||'';
     $('#e-clasificacion').setAttribute('readonly','readonly');
@@ -805,6 +809,12 @@
       fechaResuelta:$('#e-fecharesuelta').value||'',
       prioridad: editSelectedPrio, estado:$('#e-estado').value
     };
+    // Tipo de factura y fecha de emisión: solo se envían si el usuario los cambió (así no se pisa ni se bloquea nada por diferencias de formato).
+    if(editingKind==='factura'){
+      const tf = $('#e-tipofactura').value, fe = $('#e-fechaemision').value;
+      if(tf && tf!==editTipoFacturaOrig_) patch.tipoFactura = tf;
+      if(fe && fe!==editFechaEmisionOrig_) patch.fechaEmision = fe;
+    }
     if(cambioPrioVisible_()){
       const cp = { fecha:$('#e-cp-fecha').value, autorizadoPor:$('#e-cp-quien').value.trim(), confirmadoPor:$('#e-cp-medio').value };
       if(!cp.fecha || !cp.autorizadoPor || !cp.confirmadoPor){

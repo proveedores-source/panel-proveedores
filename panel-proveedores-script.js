@@ -93,7 +93,7 @@
     return Promise.race([llamada, timeout]).finally(()=>clearTimeout(timer));
   }
 
-  const CLIENT_VERSION = 'v2026-11-24-lote10-a'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-11-25-lote10-c'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -1000,6 +1000,7 @@
   function getListadoFiltered(){
     const fund = $('#listado-filt-fundacion').value, prio = $('#listado-filt-prioridad').value, est = $('#listado-filt-estado').value;
     const clasif = $('#listado-filt-clasificacion').value;
+    const centroF = $('#listado-filt-centro').value;
     const soloSC = soloSinClasificar_;
     const activo = $('#listado-filt-activo').value; // activas | eliminadas | todas
     const q = sinTildes_($('#listado-buscar').value);
@@ -1007,18 +1008,24 @@
       (activo==='todas' || (activo==='eliminadas' ? r.estado==='eliminado' : r.estado!=='eliminado')) &&
       (!fund || r.fundacion===fund) && (!prio || r.prioridad===prio) && (!est || r.estado===est) &&
       (!soloSC || sinClasificar_(r)) &&
-      (!clasif || r.clasificacionFlujo===clasif) &&
+      (!clasif || (clasif==='__sin__' ? !String(r.clasificacionFlujo||'').trim() : r.clasificacionFlujo===clasif)) &&
+      (!centroF || (centroF==='__sin__' ? !String(r.centroCosto||'').trim() : sinTildes_(r.centroCosto||'')===sinTildes_(centroF))) &&
       (!listadoFechaDesde || (r.fechaRecibida && r.fechaRecibida>=listadoFechaDesde)) &&
       (!listadoFechaHasta || (r.fechaRecibida && r.fechaRecibida<=listadoFechaHasta)) &&
       (!q || sinTildes_(r.proveedor).includes(q) || sinTildes_(r.cuit).includes(q)) );
   }
-  ['listado-filt-fundacion','listado-filt-prioridad','listado-filt-estado','listado-filt-activo','listado-filt-clasificacion'].forEach(id=> $('#'+id).addEventListener('change', renderListado));
+  ['listado-filt-fundacion','listado-filt-prioridad','listado-filt-estado','listado-filt-activo','listado-filt-clasificacion','listado-filt-centro'].forEach(id=> $('#'+id).addEventListener('change', renderListado));
   function poblarFiltroClasificacionListado(){
     const sel = $('#listado-filt-clasificacion');
     const actual = sel.value;
-    sel.innerHTML = '<option value="">Toda clasificación</option>' + clasificacionesFlujo.map(c=>`<option value="${escapeHtml(c.clasificacion)}">${escapeHtml(c.clasificacion)}</option>`).join('');
+    sel.innerHTML = '<option value="">Toda clasificación</option><option value="__sin__">⚠ Sin clasificar</option>' + clasificacionesFlujo.map(c=>`<option value="${escapeHtml(c.clasificacion)}">${escapeHtml(c.clasificacion)}</option>`).join('');
     sel.value = actual;
   }
+  (function poblarFiltroCentroListado_(){
+    const sel = $('#listado-filt-centro');
+    const opciones = Array.from($('#e-centrocosto').options).filter(o=>o.value).map(o=>'<option value="'+escapeHtml(o.value)+'">'+escapeHtml(o.textContent)+'</option>').join('');
+    sel.innerHTML = '<option value="">Todo centro de costo</option><option value="__sin__">⚠ Sin centro de costo</option>' + opciones;
+  })();
   $('#listado-buscar').addEventListener('input', renderListado);
 
   let listadoFechaDesde = '', listadoFechaHasta = '';

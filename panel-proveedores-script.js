@@ -93,7 +93,7 @@
     return Promise.race([llamada, timeout]).finally(()=>clearTimeout(timer));
   }
 
-  const CLIENT_VERSION = 'v2026-11-25-lote10-c'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-11-25-lote10-e'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -177,6 +177,23 @@
   function avisarBloqueoServidor_(err){ alert('⛔ '+String(err.message||'').replace(/^NO SE PUEDE AVANZAR:?\s*/,'NO SE PUEDE AVANZAR\n\n')+'\n\nLa operación NO se grabó.'); }
   function sinClasificar_(r){
     return !!r.isAppRecord && r.estado!=='eliminado' && r.estado!=='completado' && !r.pagado && faltaClasif_(r.centroCosto, r.clasificacionFlujo).length>0;
+  }
+  function sinCuit_(r){ return r.estado!=='eliminado' && !String(r.cuit||'').replace(/[^0-9]/g,''); }
+  function renderSinCuit_(){
+    const vista = $('#view-listado'); if(!vista) return;
+    let el = $('#sin-cuit-banner');
+    if(!el){
+      el = document.createElement('div'); el.id='sin-cuit-banner';
+      el.style.cssText='display:none;margin:0 0 12px;padding:10px 12px;border:1px solid var(--media);background:var(--media-soft);border-radius:8px;font-size:13px;';
+      vista.insertBefore(el, vista.firstChild);
+      el.addEventListener('click',(e)=>{ if(!e.target.closest('button')) return; const sel=$('#listado-filt-cuit'); sel.value = sel.value==='__sin__' ? '' : '__sin__'; renderSinCuit_(); renderListado(); });
+    }
+    const n = records.filter(sinCuit_).length;
+    const activo = $('#listado-filt-cuit').value==='__sin__';
+    if(!n && !activo){ el.style.display='none'; el.innerHTML=''; return; }
+    el.style.display='block';
+    el.innerHTML = '<b>⚠ '+n+' registro(s) SIN CUIT.</b> Sin CUIT no se pueden identificar ni pagar por transferencia con datos del proveedor. '+
+      '<button type="button" class="btn" style="margin-left:8px;">'+(activo?'Ver todos':'Ver solo esos')+'</button>';
   }
   let soloSinClasificar_ = false;
   function renderSinClasificar_(){
@@ -290,7 +307,7 @@
     }
   }
 
-  function renderAll(){ renderCounters(); renderKanban(); renderDashboard(); renderListado(); renderNotas(); renderNotasTabla(); renderAgenda(); renderTransferencias(); renderLog(); renderProvClasif(); renderClasif(); renderArca(); renderMediosPago(); renderSinClasificar_(); }
+  function renderAll(){ renderCounters(); renderKanban(); renderDashboard(); renderListado(); renderNotas(); renderNotasTabla(); renderAgenda(); renderTransferencias(); renderLog(); renderProvClasif(); renderClasif(); renderArca(); renderMediosPago(); renderSinClasificar_(); renderSinCuit_(); }
 
   /* ---------------- USUARIOS (solo admins) ---------------- */
   async function refreshUsuarios(){
@@ -531,7 +548,7 @@
     if(!clasificacionFlujo) faltantes.push('Clasificación Flujo');
     if(!importeVal) faltantes.push('Importe');
     if(tipo==='factura'){
-      if(!$('#f-cuit').value.trim()) faltantes.push('CUIT');
+      if(!$('#f-cuit').value.replace(/[^0-9]/g,'')){ cartelBloqueo_('Falta completar: CUIT.\nUna factura no se puede guardar sin CUIT.'); return; }
       if(!$('#f-tipofactura').value) faltantes.push('Tipo de comprobante');
       if(!$('#f-numfactura').value.trim()) faltantes.push('N° de factura');
       if($('#f-tipofactura').value!=='Boleta' && !$('#f-cae').value.trim()) faltantes.push('CAE');
@@ -705,12 +722,13 @@
     $('#e-cp-preview').textContent = 'Quedará registrado: «Prioridad bajada de alta a '+editSelectedPrio+' el '+(fmtFechaAR_(fecha)||'[fecha]')+' con autorización de '+(quien||'[nombre y área]')+', confirmada por '+(medio||'[mail / WhatsApp / en persona]')+'.»';
   }
   ['e-cp-quien','e-cp-medio','e-cp-fecha'].forEach(id=>{ const el=document.getElementById(id); el.addEventListener('input',actualizarCambioPrio_); el.addEventListener('change',actualizarCambioPrio_); });
-  let editTipoFacturaOrig_ = '', editFechaEmisionOrig_ = '';
+  let editTipoFacturaOrig_ = '', editFechaEmisionOrig_ = '', editingEsDelPanel_ = false;
   function openEditModal(key){
     const r = records.find(x=>x._key===key); if(!r) return;
     editingKind = r.tipo==='factura' ? 'factura' : 'otro';
     editingFundacion = r.fundacion || null;
     editingId = (editingKind==='factura' || (r.fundacion && r._rowNum)) ? r._rowNum : r.id;
+    editingEsDelPanel_ = !!r.isAppRecord;
     $('#e-tipo').value=r.tipo; $('#e-fuente').value=r.fuente||'email'; $('#e-proveedor').value=r.proveedor||'';
     $('#e-cuit').value=formatearCuit_(r.cuit||''); $('#e-importe').value=r.importe||'';
     $('#e-numfactura').value=r.numeroFactura||''; $('#e-cae').value=r.cae||'';
@@ -822,6 +840,10 @@
     const proveedorNuevo = $('#e-proveedor').value.trim();
     const faltClasifEd = faltaClasif_($('#e-centrocosto').value, $('#e-clasificacion').value);
     if(faltClasifEd.length){ cartelBloqueo_('Falta completar: '+faltClasifEd.join(' y ')+'.\nSin esos datos no se puede guardar este registro.'); return; }
+    // Facturas: el CUIT es obligatorio (las compras pueden no tenerlo). Las filas históricas de Mariana no se editan desde acá.
+    if(tipo==='factura' && (editingKind!=='factura' || editingEsDelPanel_) && !$('#e-cuit').value.replace(/[^0-9]/g,'')){
+      cartelBloqueo_('Falta completar: CUIT.\nUna factura no se puede guardar sin CUIT.'); return;
+    }
     const patch = editingKind==='factura' ? {
       proveedor:proveedorNuevo, cuit:$('#e-cuit').value.trim(),
       importe:parseFloat($('#e-importe').value)||0,
@@ -1001,6 +1023,7 @@
     const fund = $('#listado-filt-fundacion').value, prio = $('#listado-filt-prioridad').value, est = $('#listado-filt-estado').value;
     const clasif = $('#listado-filt-clasificacion').value;
     const centroF = $('#listado-filt-centro').value;
+    const cuitF = $('#listado-filt-cuit').value;
     const soloSC = soloSinClasificar_;
     const activo = $('#listado-filt-activo').value; // activas | eliminadas | todas
     const q = sinTildes_($('#listado-buscar').value);
@@ -1008,13 +1031,14 @@
       (activo==='todas' || (activo==='eliminadas' ? r.estado==='eliminado' : r.estado!=='eliminado')) &&
       (!fund || r.fundacion===fund) && (!prio || r.prioridad===prio) && (!est || r.estado===est) &&
       (!soloSC || sinClasificar_(r)) &&
+      (cuitF!=='__sin__' || sinCuit_(r)) &&
       (!clasif || (clasif==='__sin__' ? !String(r.clasificacionFlujo||'').trim() : r.clasificacionFlujo===clasif)) &&
       (!centroF || (centroF==='__sin__' ? !String(r.centroCosto||'').trim() : sinTildes_(r.centroCosto||'')===sinTildes_(centroF))) &&
       (!listadoFechaDesde || (r.fechaRecibida && r.fechaRecibida>=listadoFechaDesde)) &&
       (!listadoFechaHasta || (r.fechaRecibida && r.fechaRecibida<=listadoFechaHasta)) &&
       (!q || sinTildes_(r.proveedor).includes(q) || sinTildes_(r.cuit).includes(q)) );
   }
-  ['listado-filt-fundacion','listado-filt-prioridad','listado-filt-estado','listado-filt-activo','listado-filt-clasificacion','listado-filt-centro'].forEach(id=> $('#'+id).addEventListener('change', renderListado));
+  ['listado-filt-fundacion','listado-filt-prioridad','listado-filt-estado','listado-filt-activo','listado-filt-clasificacion','listado-filt-centro','listado-filt-cuit'].forEach(id=> $('#'+id).addEventListener('change', ()=>{ renderSinCuit_(); renderListado(); }));
   function poblarFiltroClasificacionListado(){
     const sel = $('#listado-filt-clasificacion');
     const actual = sel.value;

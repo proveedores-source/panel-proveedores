@@ -93,7 +93,7 @@
     return Promise.race([llamada, timeout]).finally(()=>clearTimeout(timer));
   }
 
-  const CLIENT_VERSION = 'v2026-11-26-lote11-a'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-11-26-lote11-b'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -2183,6 +2183,7 @@
       showToast('Pagos registrados: '+(res.registrados||0)+(res.descartados? ' · descartados: '+res.descartados : '')+((res.fallidos||[]).length? ' · con error: '+res.fallidos.length : '')+'.');
       const avisos = [];
       if((res.fallidos||[]).length) avisos.push('No se pudieron registrar estos pagos:\n\n• '+res.fallidos.map(f=>(f.proveedor||'—')+' '+(f.numeroFactura||'')+': '+f.motivo).join('\n• ')+(res.sinCambios ? '\n\nNo se registró ninguno: la exportación sigue pendiente.' : '\n\nLos demás quedaron registrados.'));
+      if((res.yaPagadas||[]).length) avisos.push('Estas facturas ya figuraban como pagadas, así que no se registró nada de nuevo:\n\n• '+res.yaPagadas.map(f=>(f.proveedor||'—')+' '+(f.numeroFactura||'')).join('\n• '));
       if((res.pdfSinMarcar||[]).length) avisos.push('No se encontró el PDF para marcar como "OP finalizada" de: '+res.pdfSinMarcar.join(', '));
       if(avisos.length) alert(avisos.join('\n\n'));
     }

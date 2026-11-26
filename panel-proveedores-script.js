@@ -93,7 +93,7 @@
     return Promise.race([llamada, timeout]).finally(()=>clearTimeout(timer));
   }
 
-  const CLIENT_VERSION = 'v2026-11-25-lote10-e'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
+  const CLIENT_VERSION = 'v2026-11-26-lote11-a'; // MDG/RVP/Otros se traen en tandas de 50 en vez de todas juntas (evita el fallo de comunicación con hojas grandes)
   let soyAdmin = false;
   function esperar_(ms){ return new Promise(resolve=>setTimeout(resolve, ms)); }
   async function callSeguro(fn, ...args){
@@ -1925,18 +1925,20 @@
     if(!conCuit.length){ showToast('Ningún contacto tiene CUIT válido de 11 dígitos cargado en la Agenda.'); return; }
     const headers = ['Tipo de documento - Beneficiario','Número de documento - Beneficiario','Condición IIBB','Condición Ganancias','Condición de I.V.A.','Razón social - Beneficiario','Calle','Núm. De puerta','Unidad funcional','Código postal','Núm. IIBB','E-mail','Piso','País','Provincia','Ciudad'];
     const data = conCuit.map(a=>({
-      'Tipo de documento - Beneficiario':'80',
+      // Valores fijos que exige el diseño de registro de Banco Macro (BNF): tipo de documento 10 (CUIT/CUIL),
+      // condiciones IIBB/Ganancias/IVA = 99 (no informado), calle "NO INFORMADA", código postal 1001; razón social hasta 40 caracteres.
+      'Tipo de documento - Beneficiario':'10',
       'Número de documento - Beneficiario': (a.cuit||'').replace(/[^0-9]/g,''),
-      'Condición IIBB':'', 'Condición Ganancias':'', 'Condición de I.V.A.':'',
-      'Razón social - Beneficiario': (a.proveedor||'').slice(0,120),
-      'Calle':'', 'Núm. De puerta':'', 'Unidad funcional':'', 'Código postal':'',
+      'Condición IIBB':'99', 'Condición Ganancias':'99', 'Condición de I.V.A.':'99',
+      'Razón social - Beneficiario': textoXlsx_(a.proveedor||'').slice(0,40),
+      'Calle':'NO INFORMADA', 'Núm. De puerta':'', 'Unidad funcional':'', 'Código postal':'1001',
       'Núm. IIBB':'', 'E-mail': a.email||'', 'Piso':'', 'País':'', 'Provincia':'', 'Ciudad':''
     }));
     const ws = XLSX.utils.json_to_sheet(data, {header: headers});
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Plantilla');
     XLSX.writeFile(wb, 'Beneficiarios_Banco_Macro_'+todayISO()+'.xlsx');
-    showToast('Generado con '+data.length+' contacto(s). Ojo: Cond. IIBB/Ganancias/IVA y Código Postal quedan en blanco (no los tenemos cargados) — hay que completarlos a mano antes de subir al banco.');
+    showToast('Generado con '+data.length+' contacto(s) con los valores fijos que pide Banco Macro (tipo doc. 10, condiciones 99, calle "NO INFORMADA", CP 1001). El e-mail solo es obligatorio si querés que el banco envíe el aviso de pago al proveedor.');
   });
 
   /* ---------------- TRANSFERENCIAS ---------------- */
@@ -2313,43 +2315,53 @@
     if(!sel.length){ showToast('Tildá al menos una factura para exportar.'); return; }
     const res = await prepararExportacionUI_('macro', sel); if(!res) return;
     const fecha = fechaHoyAR_();
-    let filas, headers, archivo;
-    if(variante==='pago-proveedores'){
-      headers = ['Modalidad de Pago','Número de documento Beneficiario','Denominación del Beneficiario','Identificación del pago','Importe','Cuenta de pago - Nro/CBU o Nº Cheque','Marca de registración de cheque','Fecha de pago - Emisión','Fecha de pago diferido'];
-      archivo = 'TRANSF_BANCO_MACRO_'+todayISO()+'.xlsx';
-      filas = res.aprobadas.map(a=>{
-        const cuenta = String(a.cbu||'').replace(/[^0-9]/g,'');
-        return {
-          'Modalidad de Pago': esCuentaMacro_(cuenta) ? '02' : '04', // 02: cuenta Macro, 04: otros bancos
-          'Número de documento Beneficiario': String(a.cuit||'').replace(/[^0-9]/g,''),
-          'Denominación del Beneficiario': textoXlsx_(a.proveedor).slice(0,120),
-          'Identificación del pago': ('FC '+facturaNumeroCorto(a.numeroFactura)).slice(0,30),
-          'Importe': Number(a.importe)||0,
-          'Cuenta de pago - Nro/CBU o Nº Cheque': cuenta,
-          'Marca de registración de cheque': '',
-          'Fecha de pago - Emisión': fecha,
-          'Fecha de pago diferido': ''
-        };
-      });
-    } else {
-      headers = ['Modalidad de Pago','Número de documento Beneficiario','Denominación del Beneficiario','Concepto','Importe','Cuenta Destino','Fecha de pago - Emisión'];
-      archivo = 'TRANSF_MASIVAS_MACRO_'+todayISO()+'.xlsx';
-      filas = res.aprobadas.map(a=>{
-        const cuenta = String(a.cbu||'').replace(/[^0-9]/g,'');
-        return {
-          'Modalidad de Pago': esCuentaMacro_(cuenta) ? '18' : '12', // 18: cuentas Macro, 12: otros bancos
+    const sufijoId = String(res.exportacionId||'').replace(/^E/,'');
+    const headersPP = ['Modalidad de Pago','Número de documento Beneficiario','Denominación del Beneficiario','Identificación del pago','Importe','Cuenta de pago - Nro/CBU o Nº Cheque','Marca de registración de cheque','Fecha de pago - Emisión','Fecha de pago diferido'];
+    const headersTM = ['Modalidad de Pago','Número de documento Beneficiario','Denominación del Beneficiario','Concepto','Importe','Cuenta Destino','Fecha de pago - Emisión'];
+    // Cada fundación tiene su propio convenio (empresa/CUIT y cuenta de débito en Macro): un archivo por fundación, nunca mezcladas.
+    // En transferencias masivas, además, el banco no admite mezclar "cuentas Macro" (18) con "otros bancos" (12): archivos separados.
+    const fundaciones = Array.from(new Set(res.aprobadas.map(a=>a.fundacion)));
+    const archivos = [];
+    fundaciones.forEach(fk=>{
+      const deFund = res.aprobadas.filter(a=>a.fundacion===fk);
+      const etiqueta = FUNDACION_INFO_LABEL(fk);
+      if(variante==='pago-proveedores'){
+        const filas = deFund.map(a=>{
+          const cuenta = String(a.cbu||'').replace(/[^0-9]/g,'');
+          return {
+            'Modalidad de Pago': esCuentaMacro_(cuenta) ? '02' : '04', // 02: cuenta Macro, 04: otros bancos
+            'Número de documento Beneficiario': String(a.cuit||'').replace(/[^0-9]/g,''),
+            'Denominación del Beneficiario': textoXlsx_(a.proveedor).slice(0,120),
+            // El banco exige que la identificación del pago sea ÚNICA: se agrega el código de esta exportación.
+            'Identificación del pago': ('FC '+facturaNumeroCorto(a.numeroFactura)+'-'+sufijoId).slice(0,30),
+            'Importe': Number(a.importe)||0,
+            'Cuenta de pago - Nro/CBU o Nº Cheque': cuenta,
+            'Marca de registración de cheque': '',
+            'Fecha de pago - Emisión': fecha,
+            'Fecha de pago diferido': ''
+          };
+        });
+        archivos.push({ filas, headers: headersPP, nombre: 'PAGO_PROVEEDORES_MACRO_'+etiqueta+'_'+todayISO()+'.xlsx' });
+      } else {
+        const filasDe = (macro)=>deFund.filter(a=>esCuentaMacro_(String(a.cbu||'').replace(/[^0-9]/g,''))===macro).map(a=>({
+          'Modalidad de Pago': macro ? '18' : '12', // 18: cuentas Macro, 12: otros bancos o billeteras
           'Número de documento Beneficiario': String(a.cuit||'').replace(/[^0-9]/g,''),
           'Denominación del Beneficiario': textoXlsx_(a.proveedor).slice(0,120),
           'Concepto': 'FAC',
           'Importe': Number(a.importe)||0,
-          'Cuenta Destino': cuenta,
+          'Cuenta Destino': String(a.cbu||'').replace(/[^0-9]/g,''),
           'Fecha de pago - Emisión': fecha
-        };
-      });
-    }
-    const ok = await generarOCancelar_(res, async ()=>{ hojaDe_(filas, headers, 'Plantilla', archivo); });
+        }));
+        const aMacro = filasDe(true), aOtros = filasDe(false);
+        if(aMacro.length) archivos.push({ filas:aMacro, headers: headersTM, nombre: 'TRANSF_MASIVAS_MACRO_'+etiqueta+'_CUENTAS_MACRO_'+todayISO()+'.xlsx' });
+        if(aOtros.length) archivos.push({ filas:aOtros, headers: headersTM, nombre: 'TRANSF_MASIVAS_MACRO_'+etiqueta+'_OTROS_BANCOS_'+todayISO()+'.xlsx' });
+      }
+    });
+    const ok = await generarOCancelar_(res, async ()=>{
+      for(const a of archivos){ hojaDe_(a.filas, a.headers, 'Plantilla', a.nombre); await esperar_(500); } // el navegador puede bloquear descargas simultáneas
+    });
     if(!ok) return;
-    showToast('Archivo Banco Macro generado: '+filas.length+' pago(s). Falta confirmar cuáles se subieron al banco.');
+    showToast('Banco Macro: '+archivos.length+' archivo(s) generado(s) ('+res.aprobadas.length+' pago(s); '+fundaciones.map(FUNDACION_INFO_LABEL).join(' y ')+'). Falta confirmar cuáles se subieron al banco.');
     await terminarExportacion_(res);
   }
   $('#btn-macro-pago-proveedores').addEventListener('click', ()=>exportarMacro_('pago-proveedores'));
